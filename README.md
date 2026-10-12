@@ -115,4 +115,4 @@ macstyle is built on the work of many people: the authors of the GNOME extension
 
 macstyle's own code is under the [GNU General Public License 3.0](LICENSE). The bundled parts keep their own licences.
 
-Created by **Hilali Abdel**.
+Created by **Hilali Abdel** :).
