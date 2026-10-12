@@ -1,0 +1,610 @@
+--- a/multi-monitors-bar@frederykabryan/mirroredIndicatorButton.js
++++ b/multi-monitors-bar@frederykabryan/mirroredIndicatorButton.js
+@@ -24,6 +24,7 @@
+ 
+ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
++import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+ import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+ 
+ const MMWorkspacePreviewLayout = GObject.registerClass(
+@@ -249,6 +250,9 @@
+             watch(this._sourceIndicator, 'notify::visible');
+             watch(this._sourceIndicator, 'notify::mapped');
+             watch(this._sourceIndicator, 'notify::allocation');
++            // An item can also be hidden through its container (Unite does
++            // that with its window buttons).
++            watch(this._sourceIndicator?.container, 'notify::visible');
+ 
+             const sourceChild = this._sourceIndicator?.get_first_child();
+             this._sourcePresenceChild = sourceChild;
+@@ -271,12 +275,24 @@
+             const hasContent = this._sourceIndicator.visible &&
+                 sourceChild &&
+                 this._hasVisibleRenderableSourceContent(sourceChild);
++            // A hidden container hides the item without emptying it: the
++            // mirror stays (it is not a phantom) and comes back with its source.
++            const sourceContainer = this._sourceIndicator.container;
++            const shown = !!hasContent && (!sourceContainer || sourceContainer.visible);
++            if (!shown)
++                this._releaseSourceButtons();
++            // Coming back: let the source be laid out before the mirror shows.
++            // Otherwise the clone, which is laid out first, gives the source
++            // its natural size for a moment and the mirror is resized twice
++            // within one layout cycle (Clutter warns about that).
++            if (shown && !this.visible)
++                sourceChild.get_allocation_box();
+ 
+             this._isEmpty = !hasContent;
+-            this.visible = !!hasContent;
+-            this.reactive = !!hasContent;
+-            this.can_focus = !!hasContent;
+-            this.track_hover = !!hasContent;
++            this.visible = shown;
++            this.reactive = shown;
++            this.can_focus = shown;
++            this.track_hover = shown;
+         }
+ 
+         _hasVisibleRenderableSourceContent(actor) {
+@@ -386,6 +402,9 @@
+             }
+ 
+             // 5. Generic Handling
++            // Nothing here styles the button itself, so the panel can give it
++            // the style classes of its source.
++            this._plainMirror = true;
+             if (sourceChild instanceof St.BoxLayout) {
+                 // Container is FILL to get full-height hover, but clone inside is centered
+                 const container = new St.BoxLayout({
+@@ -1935,7 +1954,112 @@
+             return Clutter.EVENT_PROPAGATE;
+         }
+ 
++        // The buttons of a source that is a plain row of buttons without a
++        // menu, such as Unite's window buttons.
++        _getSourceButtons() {
++            const source = this._sourceIndicator;
++            if (!source || (source.menu && !(source.menu instanceof PopupMenu.PopupDummyMenu)))
++                return [];
++
++            const box = source.get_first_child();
++            if (!(box instanceof St.BoxLayout))
++                return [];
++
++            const children = box.get_children().filter(child => child.visible);
++            return children.length > 0 && children.every(child => child instanceof St.Button)
++                ? children : [];
++        }
++
++        _findCloneOf(source, actor = this) {
++            for (const child of actor.get_children()) {
++                if (child instanceof Clutter.Clone && child.source === source)
++                    return child;
++
++                const found = this._findCloneOf(source, child);
++                if (found)
++                    return found;
++            }
++
++            return null;
++        }
++
++        // The source button drawn under the pointer. Like the source, a
++        // button takes the full height of the panel.
++        _sourceButtonAt(event, buttons) {
++            const box = buttons[0].get_parent();
++            const clone = this._findCloneOf(box);
++            if (!clone || box.width <= 0)
++                return null;
++
++            const [stageX, stageY] = event.get_coords();
++            const [ok, x] = clone.transform_stage_point(stageX, stageY);
++            if (!ok)
++                return null;
++
++            const scale = clone.width / box.width;
++            return buttons.find(button => {
++                const allocation = button.get_allocation_box();
++                return x >= allocation.x1 * scale && x < allocation.x2 * scale;
++            }) ?? null;
++        }
++
++        // Such a row is shown here as one picture: pass hover, press and click
++        // on to the button under the pointer. The click then does what it does
++        // on the main panel.
++        _forwardToSourceButtons(event) {
++            const type = event.type();
++            const isButton = type === Clutter.EventType.BUTTON_PRESS ||
++                type === Clutter.EventType.BUTTON_RELEASE;
++            if (!isButton && type !== Clutter.EventType.MOTION &&
++                type !== Clutter.EventType.ENTER && type !== Clutter.EventType.LEAVE)
++                return false;
++
++            const buttons = this._getSourceButtons();
++            if (buttons.length === 0)
++                return false;
++
++            const target = type === Clutter.EventType.LEAVE
++                ? null : this._sourceButtonAt(event, buttons);
++            this._sourceButtonsInUse = true;
++            for (const button of buttons)
++                button.set_hover(button === target);
++
++            // A press ends with the release, or when the pointer leaves.
++            if (type === Clutter.EventType.LEAVE ||
++                (isButton && event.get_button() === Clutter.BUTTON_PRIMARY)) {
++                const pressed = this._pressedSourceButton ?? null;
++                this._pressedSourceButton = null;
++                pressed?.remove_style_pseudo_class('active');
++
++                if (type === Clutter.EventType.BUTTON_PRESS) {
++                    this._pressedSourceButton = target;
++                    target?.add_style_pseudo_class('active');
++                } else if (type === Clutter.EventType.BUTTON_RELEASE &&
++                    pressed && pressed === target) {
++                    pressed.emit('clicked', Clutter.BUTTON_PRIMARY);
++                }
++            }
++
++            return isButton;
++        }
++
++        // Take back the hover and press this mirror put on the source's buttons.
++        _releaseSourceButtons() {
++            if (!this._sourceButtonsInUse)
++                return;
++
++            this._sourceButtonsInUse = false;
++            this._pressedSourceButton = null;
++            for (const button of this._getSourceButtons()) {
++                button.set_hover(false);
++                button.remove_style_pseudo_class('active');
++            }
++        }
++
+         vfunc_event(event) {
++            if (this._forwardToSourceButtons(event))
++                return Clutter.EVENT_STOP;
++
+             if (event.type() === Clutter.EventType.BUTTON_PRESS) {
+                 return this.vfunc_button_press_event(event);
+             }
+@@ -3268,7 +3392,9 @@
+             // Source-presence handlers were connected with connectObject(this);
+             // GJS auto-disconnects them on destroy, but disconnect explicitly
+             // for the non-destroy cleanup path too.
++            this._releaseSourceButtons();
+             this._sourceIndicator?.disconnectObject(this);
++            this._sourceIndicator?.container?.disconnectObject(this);
+             this._sourcePresenceChild?.disconnectObject(this);
+             this._sourcePresenceChild = null;
+             this._sourcePresenceWatched = false;
+--- a/multi-monitors-bar@frederykabryan/mmlayout.js
++++ b/multi-monitors-bar@frederykabryan/mmlayout.js
+@@ -303,6 +303,34 @@
+ 		} else if (typeof panelBlur.blur_panel === 'function') {
+ 			panelBlur.blur_panel(panel);
+ 		}
++
++		this._followBlurMyShellOverride(panelBlur, panel);
++	}
++
++	// BMS gives its background override (the 'transparent-panel' class or one
++	// of its siblings) only to the panels it knows when it starts. A panel it
++	// blurs later keeps the theme's own background on top of the blur and
++	// looks different from the main panel. Ask BMS to treat it like the main one.
++	_followBlurMyShellOverride(panelBlur, panel) {
++		try {
++			const actors = panelBlur.actors_list?.find(a => a.widgets?.panel === panel);
++			if (!actors || typeof panelBlur.set_should_override_panel !== 'function')
++				return;
++
++			if (panelBlur.settings?.panel?.OVERRIDE_BACKGROUND_DYNAMICALLY) {
++				// BMS decides for each panel from the windows near it
++				panelBlur.update_visibility?.();
++				return;
++			}
++
++			const styles = ['transparent-panel', 'light-panel', 'dark-panel', 'contrasted-panel'];
++			const wanted = styles.find(s => Main.panel.has_style_class_name(s));
++			const current = styles.find(s => panel.has_style_class_name(s));
++			if (wanted !== current)
++				panelBlur.set_should_override_panel(actors, wanted !== undefined);
++		} catch (e) {
++			// BMS internals changed: the panel keeps its blur without the override
++		}
+ 	}
+ 
+ 	showDock() {
+--- a/multi-monitors-bar@frederykabryan/mmoverview.js
++++ b/multi-monitors-bar@frederykabryan/mmoverview.js
+@@ -46,6 +46,12 @@
+ 
+ export const THUMBNAILS_SLIDER_POSITION_ID = 'thumbnails-slider-position';
+ 
++// Vertical spacing of the overview as a share of its height: the value of
++// VERTICAL_SPACING_RATIO in overviewControls.js, which does not export it.
++const VERTICAL_SPACING_RATIO = 0.02;
++// Padding around the search entry and the content area, in pixels.
++const OVERVIEW_GROUP_PADDING = 30;
++
+ class MultiMonitorsWorkspaceThumbnailClass extends St.Widget {
+     _init(metaWorkspace, monitorIndex) {
+         super._init({
+@@ -623,7 +629,7 @@
+                 name: 'mm-overview-group-' + index,
+                 x_expand: true, y_expand: true,
+                 vertical: true,
+-                style: 'padding: 30px;' // Add some padding so it doesn't touch edges
++                style: `padding: ${OVERVIEW_GROUP_PADDING}px;` // Add some padding so it doesn't touch edges
+             });
+             this.add_child(this._group);
+ 
+@@ -994,6 +1000,8 @@
+                 return;
+             }
+ 
++            this._syncNativeAppDisplayMargins();
++
+             layoutManager = this._appDisplay?._grid?.layoutManager;
+             if (!layoutManager)
+                 return;
+@@ -1033,15 +1041,141 @@
+             }
+ 
+             const portrait = this._isPortraitMonitor();
+-            const lift = portrait
+-                ? Math.max(180, Math.min(Math.round(monitor.height * 0.14), 320))
+-                : Math.max(90, Math.min(Math.round(monitor.height * 0.09), 160));
++            // Nothing to clear when the app grid already ends above the dock
++            // (see _syncNativeAppDisplayMargins).
++            let lift = 0;
++            if (!(this._getAppGridMetrics()?.dashHeight > 0)) {
++                lift = portrait
++                    ? Math.max(180, Math.min(Math.round(monitor.height * 0.14), 320))
++                    : Math.max(90, Math.min(Math.round(monitor.height * 0.09), 160));
++            }
+ 
+             indicators.translation_y = -lift;
+             indicators.visible = true;
+             indicators.opacity = 255;
+         }
+ 
++        // Heights of the app-grid page, with the arithmetic that
++        // ControlsManagerLayout (overviewControls.js) uses on the primary
++        // monitor: below the search entry a strip for the workspace previews,
++        // below the strip the app grid, and the dash's height left free at
++        // the bottom.
++        _getAppGridMetrics() {
++            let height = this.height;
++            if (!(height > 0))
++                height = Main.layoutManager.getWorkAreaForMonitor(this._monitorIndex)?.height ?? 0;
++            if (!(height > 0))
++                return null;
++
++            return {
++                spacing: Math.round(height * VERTICAL_SPACING_RATIO),
++                stripHeight: Math.round(height * (OverviewControls.SMALL_WORKSPACE_RATIO ?? 0.15)),
++                dashHeight: Math.round(Main.overview.dash?.height ?? 0),
++            };
++        }
++
++        // Start the app grid below the workspace previews and end it above
++        // the dock, like the primary monitor's.
++        _syncNativeAppDisplayMargins() {
++            const metrics = this._getAppGridMetrics();
++            if (!metrics || !this._appDisplay)
++                return;
++
++            const top = 2 * metrics.spacing + metrics.stripHeight;
++            const bottom = Math.max(0,
++                metrics.dashHeight + metrics.spacing - OVERVIEW_GROUP_PADDING);
++
++            // As a style: St sets an actor's margins again from its style
++            // whenever the style is computed anew.
++            const style = `margin-top: ${top}px; margin-bottom: ${bottom}px;`;
++            if (this._appDisplay.style !== style)
++                this._appDisplay.style = style;
++        }
++
++        // Where the workspace previews go in the app-grid state: `y` in the
++        // coordinates of `view`, below this monitor's search entry.
++        _getWorkspacesStrip(view) {
++            const metrics = this._getAppGridMetrics();
++            const parent = view?.get_parent();
++            if (this._destroying || !metrics || !parent ||
++                !this._contentArea?.has_allocation())
++                return null;
++
++            const [, contentY] = this._contentArea.get_transformed_position();
++            const [, parentY] = parent.get_transformed_position();
++            // Without the view's own transform.
++            const y = Math.round(contentY - parentY - view.allocation.y1) + metrics.spacing;
++            if (!Number.isFinite(y))
++                return null;
++
++            return {y, height: metrics.stripHeight};
++        }
++
++        _usesWorkspacesStrip(view) {
++            return !!view && Object.hasOwn(view, '_getWorkspacesBoxForState');
++        }
++
++        // GNOME lays a secondary monitor's workspaces out for an overview
++        // without an app grid: at full size in the app-grid state too. Give
++        // them the strip of the primary monitor there, so that GNOME itself
++        // sizes the previews and animates between the two states.
++        _installWorkspacesStrip(view) {
++            if (typeof view?._getWorkspacesBoxForState !== 'function' ||
++                this._usesWorkspacesStrip(view))
++                return;
++
++            const manager = this;
++            const appGridState = OverviewControls.ControlsState?.APP_GRID ?? 2;
++
++            view._getWorkspacesBoxForState = function (state, ...args) {
++                const box = Object.getPrototypeOf(this)
++                    ._getWorkspacesBoxForState.call(this, state, ...args);
++                if (state !== appGridState)
++                    return box;
++
++                const strip = manager._getWorkspacesStrip(this);
++                if (!strip)
++                    return box;
++
++                manager._keepStripHeight(this._workspacesView);
++                box.set_origin(box.x1, strip.y);
++                box.set_size(box.get_width(), strip.height);
++                return box;
++            };
++            view.queue_relayout();
++        }
++
++        // Dash to Dock shortens the previews of a secondary monitor by its
++        // dock's height, to keep them clear of the dock. The strip is far from
++        // the dock: give the previews its whole height, as GNOME does.
++        _keepStripHeight(view) {
++            if (typeof view?._getFirstFitAllWorkspaceBox !== 'function' ||
++                Object.hasOwn(view, '_getFirstFitAllWorkspaceBox'))
++                return;
++
++            view._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
++                const fitAllBox = Object.getPrototypeOf(this)
++                    ._getFirstFitAllWorkspaceBox.call(this, box, spacing, vertical);
++                if (!vertical) {
++                    fitAllBox.y1 = box.y1;
++                    fitAllBox.y2 = box.y2;
++                }
++                return fitAllBox;
++            };
++        }
++
++        _removeWorkspacesStrip(view) {
++            if (!view)
++                return;
++
++            if (Object.hasOwn(view, '_getWorkspacesBoxForState'))
++                delete view._getWorkspacesBoxForState;
++
++            const workspacesView = view._workspacesView;
++            if (workspacesView && Object.hasOwn(workspacesView, '_getFirstFitAllWorkspaceBox'))
++                delete workspacesView._getFirstFitAllWorkspaceBox;
++        }
++
+         _isPortraitMonitor() {
+             const monitor = Main.layoutManager.monitors[this._monitorIndex];
+             return !!monitor && monitor.height > monitor.width;
+@@ -1092,6 +1226,18 @@
+                 return;
+             }
+ 
++            // A view with the strip places the previews itself.
++            if (this._usesWorkspacesStrip(this._workspacesViews)) {
++                const strip = compact ? this._getWorkspacesStrip(this._workspacesViews) : null;
++                const stripKey = strip ? `strip:${strip.y}:${strip.height}` : 'strip';
++                if (this._lastWorkspaceTransformKey !== stripKey) {
++                    this._resetWorkspacesViewTransform();
++                    this._workspacesViews.queue_relayout();
++                    this._lastWorkspaceTransformKey = stripKey;
++                }
++                return;
++            }
++
+             const fullGeometry = this._getFullWorkspaceGeometry();
+             if (!fullGeometry)
+                 return;
+@@ -1365,6 +1511,7 @@
+                 return;
+ 
+             this._workspacesViews?.disconnectObject(this);
++            this._removeWorkspacesStrip(this._workspacesViews);
+ 
+             this._workspacesViews = view;
+             this._lastWorkspaceTransformKey = null;
+@@ -1372,6 +1519,8 @@
+             if (!view)
+                 return;
+ 
++            this._installWorkspacesStrip(view);
++
+             view.connectObject('destroy', () => {
+                 this._workspacesViews = null;
+                 this._lastWorkspaceTransformKey = null;
+@@ -1458,6 +1607,7 @@
+             this._overviewStateAdjustment?.disconnectObject(this);
+             this._overviewStateAdjustment = null;
+             this._resetWorkspacesViewTransform();
++            this._removeWorkspacesStrip(this._workspacesViews);
+             // Drop the borrowed workspacesView's `destroy` handler. connectObject
+             // auto-cleans when this actor is finalized, but this covers the paths
+             // where _disconnectAll runs without our own destruction.
+--- a/multi-monitors-bar@frederykabryan/mmpanel.js
++++ b/multi-monitors-bar@frederykabryan/mmpanel.js
+@@ -643,6 +643,13 @@
+         }
+ 
+         _showDateTime() {
++            this._placeDateTime();
++            // The date menu is placed last on every refresh, so this is where
++            // the panel is brought back in line with the main panel.
++            this._followMainPanel();
++        }
++
++        _placeDateTime() {
+             const name = 'dateMenu';
+             if (this._settings.get_boolean(SHOW_DATE_TIME_ID)) {
+                 const indicator = this._ensureIndicator(name);
+@@ -1135,12 +1142,8 @@
+             if (mainPanel._leftBox) {
+                 const children = mainPanel._leftBox.get_children();
+                 for (let child of children) {
+-                    if (!child.visible) {
+-                        continue;
+-                    }
+-
+                     const role = findRoleForChild(child);
+-                    if (role) {
++                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                         leftIndicators.push(role);
+                     }
+                 }
+@@ -1149,12 +1152,8 @@
+             if (mainPanel._centerBox) {
+                 const children = mainPanel._centerBox.get_children();
+                 for (let child of children) {
+-                    if (!child.visible) {
+-                        continue;
+-                    }
+-
+                     const role = findRoleForChild(child);
+-                    if (role) {
++                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                         centerIndicators.push(role);
+                     }
+                 }
+@@ -1163,12 +1162,8 @@
+             if (mainPanel._rightBox) {
+                 const children = mainPanel._rightBox.get_children();
+                 for (let child of children) {
+-                    if (!child.visible) {
+-                        continue;
+-                    }
+-
+                     const role = findRoleForChild(child);
+-                    if (role) {
++                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                         rightIndicators.push(role);
+                     }
+                 }
+@@ -1194,6 +1189,14 @@
+             this._updateBox(rightIndicators, this._rightBox);
+         }
+ 
++        // A mirror hides and shows with its source, so a hidden item of the
++        // main panel still gets one: Unite's window buttons, for example,
++        // come and go with the focused window. Items that are built here
++        // instead of mirrored have nothing to follow.
++        _mirrorFollowsVisibility(role) {
++            return role !== 'activities' && !MULTI_MONITOR_PANEL_ITEM_IMPLEMENTATIONS[role];
++        }
++
+         _isArcMenuRole(role) {
+             if (role !== 'ArcMenu')
+                 return false;
+@@ -1265,6 +1268,95 @@
+                 }
+             }
+         }
++
++        _followMainPanel() {
++            if (!this._settings || !Main.panel?.statusArea)
++                return;
++
++            this._applyMainPanelStyles();
++            this._applyMainPanelOrder();
++        }
++
++        // Extensions that change the panel spacing do it with an inline style
++        // on each button of the main panel. Take it over, so that an item is as
++        // wide here as it is there.
++        _applyMainPanelStyles() {
++            for (const role in this.statusArea) {
++                const indicator = this.statusArea[role];
++                const mainIndicator = Main.panel.statusArea[role];
++                if (!indicator?.set_style || !mainIndicator?.get_style)
++                    continue;
++
++                const style = mainIndicator.get_style();
++                if (indicator.get_style() !== style)
++                    indicator.set_style(style);
++
++                // A plain mirror takes the style classes too: extensions size
++                // their buttons with them (AppMenu) or drop the panel-button
++                // look (Unite's window buttons).
++                if (indicator._plainMirror) {
++                    const styleClass = mainIndicator.get_style_class_name();
++                    if (indicator.get_style_class_name() !== styleClass)
++                        indicator.set_style_class_name(styleClass);
++                }
++            }
++        }
++
++        // Position of the main panel's item for this role among the children
++        // of its box, or -1 when the main panel has no such item in that box.
++        _mainPanelIndexOf(role, mainChildren) {
++            const mainIndicator = Main.panel.statusArea[role];
++            const mainContainer = mainIndicator?.container || mainIndicator;
++            if (!mainContainer)
++                return -1;
++
++            return mainChildren.findIndex(child => child === mainContainer ||
++                (child.contains && child.contains(mainContainer)));
++        }
++
++        // Keep the items of the left and right box in the main panel's order.
++        // The mirroring above follows it, but Quick Settings is then forced to
++        // the end and the date menu is placed by its own setting, so whatever
++        // the main panel shows after those two (a user menu, for example) ends
++        // up before them here. An item the main panel does not have stays
++        // behind the item on its left. The date menu only takes part when the
++        // main panel has its own in the same box; otherwise the date/time
++        // setting alone decides where it goes.
++        _applyMainPanelOrder() {
++            for (const boxName of ['_leftBox', '_rightBox']) {
++                const box = this[boxName];
++                const mainBox = Main.panel[boxName];
++                if (!box || !mainBox)
++                    continue;
++
++                const mainChildren = mainBox.get_children();
++                const ranks = new Map();
++                for (const role in this.statusArea) {
++                    const indicator = this.statusArea[role];
++                    const container = indicator?.container || indicator;
++                    if (!container || container.get_parent() !== box)
++                        continue;
++
++                    const rank = this._mainPanelIndexOf(role, mainChildren);
++                    if (rank >= 0)
++                        ranks.set(container, rank);
++                }
++
++                let lastRank = -1;
++                const sorted = box.get_children().map((child, position) => {
++                    const ranked = ranks.has(child);
++                    if (ranked)
++                        lastRank = ranks.get(child);
++                    return { child, rank: lastRank, ranked, position };
++                }).sort((a, b) =>
++                    a.rank - b.rank || b.ranked - a.ranked || a.position - b.position);
++
++                sorted.forEach((entry, index) => {
++                    if (box.get_child_at_index(index) !== entry.child)
++                        box.set_child_at_index(entry.child, index);
++                });
++            }
++        }
+     });
+ 
+ // Helper methods injected into MultiMonitorsPanel prototype

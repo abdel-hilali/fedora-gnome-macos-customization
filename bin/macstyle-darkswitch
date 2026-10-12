@@ -1,0 +1,37 @@
+#!/bin/sh
+# macstyle-darkswitch: keep the GTK3 theme, icon theme, shell theme, Blur my Shell styles
+# and the window-corner shadows in step with GNOME's Dark Style switch. Run by
+# macstyle-darkswitch.service.
+# GTK4 and libadwaita apps follow through ~/.config/gtk-4.0/gtk.css, the wallpaper
+# through picture-uri-dark; neither needs this script.
+s=org.gnome.desktop.interface
+u=/org/gnome/shell/extensions/user-theme/name
+b=/org/gnome/shell/extensions/blur-my-shell
+r=/org/gnome/shell/extensions/rounded-window-corners-reborn
+# Rounded Window Corners Reborn has one outline colour and one pair of shadows for both
+# modes; these values match WhiteSur's own window outline and shadows in each mode.
+# corners ALPHA "V BLUR SPREAD OPACITY" (focused) "V BLUR SPREAD OPACITY" (unfocused)
+shadow() { echo "{'horizontalOffset': 0, 'verticalOffset': $1, 'blurOffset': $2, 'spreadRadius': $3, 'opacity': $4}"; }
+corners() {
+  dconf write $r/global-rounded-corner-settings "{'padding': <{'left': uint32 1, 'right': uint32 1, 'top': uint32 1, 'bottom': uint32 1}>, 'keepRoundedCorners': <{'maximized': false, 'fullscreen': false}>, 'borderRadius': <uint32 12>, 'smoothing': <0.0>, 'borderColor': <(0.0, 0.0, 0.0, $1)>, 'enabled': <true>}"
+  dconf write $r/focused-shadow "$(shadow $2)"
+  dconf write $r/unfocused-shadow "$(shadow $3)"
+}
+apply() {
+  if [ "$(gsettings get $s color-scheme)" = "'prefer-dark'" ]; then v=Dark i=dark; else v=Light i=light; fi
+  # Light uses WhiteSur-Light-soft: WhiteSur-Light with softer backgrounds (made by make-soft-theme.sh).
+  if [ $v = Light ]; then g=WhiteSur-Light-soft; else g=WhiteSur-Dark; fi
+  [ "$(gsettings get $s gtk-theme)"  = "'$g'" ] || gsettings set $s gtk-theme "$g"
+  [ "$(gsettings get $s icon-theme)" = "'MacTahoe-$i'" ] || gsettings set $s icon-theme "MacTahoe-$i"
+  [ "$(dconf read $u)" = "'WhiteSur-$v'" ] || dconf write $u "'WhiteSur-$v'"
+  if [ $v = Dark ]; then
+    dconf write $b/panel/style-panel 2
+    dconf write $b/dash-to-dock/style-dash-to-dock 2
+    corners 0.75 '9 20 -4 85' '6 16 -5 65'
+  else
+    dconf reset $b/panel/style-panel
+    dconf write $b/dash-to-dock/style-dash-to-dock 1
+    corners 0.12 '8 18 -4 68' '6 16 -5 50'
+  fi
+}
+apply; gsettings monitor $s color-scheme | while read -r _; do apply; done

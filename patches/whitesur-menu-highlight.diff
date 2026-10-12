@@ -1,0 +1,22 @@
+--- a/WhiteSur-Light/gnome-shell/gnome-shell.css
++++ b/WhiteSur-Light/gnome-shell/gnome-shell.css
+@@ -2501,7 +2501,7 @@
+   icon-shadow: none !important;
+   border-radius: 10px !important;
+   font-weight: normal;
+-  transition: none;
++  transition-duration: 0ms; /* was "transition: none", which GNOME Shell ignores (plan 04, 2026-10-12) */
+ }
+ 
+ .popup-menu-item:checked {
+--- a/WhiteSur-Dark/gnome-shell/gnome-shell.css
++++ b/WhiteSur-Dark/gnome-shell/gnome-shell.css
+@@ -2501,7 +2501,7 @@
+   icon-shadow: none !important;
+   border-radius: 8px !important;
+   font-weight: normal;
+-  transition: none;
++  transition-duration: 0ms; /* was "transition: none", which GNOME Shell ignores (plan 04, 2026-10-12) */
+ }
+ 
+ .popup-menu-item:checked {

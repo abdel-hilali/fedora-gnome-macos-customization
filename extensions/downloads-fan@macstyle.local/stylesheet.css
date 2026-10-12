@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/* Downloads Fan.
+ *
+ * Layout only. The colours come from the shell theme's popup menus: the text colour of
+ * .popup-menu (on the fan's layer) and the background and border of .popup-menu-content
+ * (on every pill), so the fan is light under WhiteSur-Light and dark under WhiteSur-Dark.
+ * The highlight is the accent colour. .dark (org.gnome.desktop.interface color-scheme)
+ * only deepens the shadows. .downloads-fan-fallback is added only for a theme whose popup
+ * menus have no background of their own.
+ */
+
+.downloads-fan-item {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* Keep "spacing" in step with LABEL_SPACING in fan.js. */
+.downloads-fan-item-box {
+  spacing: 8px;
+}
+
+.downloads-fan .downloads-fan-label {
+  margin: 0;
+  min-width: 0;
+  padding: 4px 11px 5px 11px;
+  border-radius: 9px;
+  font-size: 0.9em;
+  font-weight: 500;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.16);
+  transition-duration: 110ms;
+}
+
+.downloads-fan .downloads-fan-open-circle {
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 17px;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.16);
+  transition-duration: 110ms;
+}
+
+.downloads-fan-open-icon {
+  icon-size: 16px;
+}
+
+.downloads-fan-icon {
+  icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+.downloads-fan-message .downloads-fan-label {
+  font-style: italic;
+}
+
+/* Dark style: the theme's dark colours, deeper shadows. */
+.downloads-fan.dark .downloads-fan-label,
+.downloads-fan.dark .downloads-fan-open-circle {
+  box-shadow: 0 1px 4px 0 rgba(0, 0, 0, 0.45);
+}
+
+.downloads-fan.dark .downloads-fan-icon {
+  icon-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+/* Only for themes whose popup menus have no background of their own. */
+.downloads-fan.downloads-fan-fallback .downloads-fan-label,
+.downloads-fan.downloads-fan-fallback .downloads-fan-open-circle {
+  background-color: rgba(246, 246, 246, 0.95);
+  color: #2e2e2e;
+}
+
+.downloads-fan.downloads-fan-fallback.dark .downloads-fan-label,
+.downloads-fan.downloads-fan-fallback.dark .downloads-fan-open-circle {
+  background-color: rgba(44, 44, 46, 0.95);
+  color: #ececec;
+}
+
+/* The one selected row (pointer or keyboard) in the accent colour, fading in and out
+ * over the pill's transition-duration. Last and most specific, so it wins over all of
+ * the above. */
+.downloads-fan .downloads-fan-item:selected .downloads-fan-item-box .downloads-fan-label,
+.downloads-fan .downloads-fan-item:selected .downloads-fan-item-box .downloads-fan-open-circle {
+  background-color: -st-accent-color;
+  color: -st-accent-fg-color;
+}
+
+.downloads-fan .downloads-fan-item:selected:active .downloads-fan-item-box .downloads-fan-label,
+.downloads-fan .downloads-fan-item:selected:active .downloads-fan-item-box .downloads-fan-open-circle {
+  background-color: st-darken(-st-accent-color, 8%);
+}

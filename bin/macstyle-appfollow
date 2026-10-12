@@ -1,0 +1,713 @@
+#!/usr/bin/python3 -I
+"""macstyle-appfollow: Chromium browsers and Electron apps follow the top bar (plan 03, 2026-10-12).
+
+On GNOME (Wayland) these apps draw their own title bar and menu, out of reach of AppMenu and Unite.
+As X11 clients with the system title bar they hand their menu to the top bar (AppMenu's registrar),
+and mutter draws their title bar, which Unite removes while the window is maximized. This tool sets
+that up for every such app it finds; its systemd path unit runs it again whenever an app is
+installed, updated or removed.
+
+  launcher  A copy of the app's .desktop file in ~/.local/share/applications, with
+            --ozone-platform=x11 after the program on each Exec line and a marker line naming the
+            source file and its checksum. Rewritten when the source changes, deleted when it is
+            gone. A copy without the marker belongs to the user and is left alone, unless it is
+            exactly what this tool would write (then it is taken over).
+  settings  The system title bar, written once per setting and only while the app is closed:
+            VS Code and its forks "window.titleBarStyle": "native" and
+            "window.customTitleBarVisibility": "never"; Chromium browsers
+            browser.custom_chrome_frame false in each profile. A value the user set is kept, and a
+            setting the user removes later stays removed.
+
+Usage:
+  macstyle-appfollow              scan and apply
+  macstyle-appfollow --dry-run    show what it would do, write nothing
+  macstyle-appfollow --verbose    also list what needs nothing (a run otherwise prints only changes)
+  macstyle-appfollow --settle N   wait N seconds first, scan again while the launcher folders
+                                  keep changing (what the systemd units run)
+  macstyle-appfollow --skip ID    leave the launcher ID alone from now on (deletes this tool's copy)
+  macstyle-appfollow --unskip ID
+Folders follow XDG_DATA_DIRS, XDG_DATA_HOME, XDG_CONFIG_HOME and XDG_STATE_HOME.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+FLAG = '--ozone-platform=x11'
+MARK = '# macstyle-appfollow: copy of '
+HOME = os.path.expanduser('~')
+DATA_HOME = os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local', 'share')
+CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME') or os.path.join(HOME, '.config')
+STATE_HOME = os.environ.get('XDG_STATE_HOME') or os.path.join(HOME, '.local', 'state')
+TARGET = os.path.join(DATA_HOME, 'applications')
+STATE_DIR = os.path.join(STATE_HOME, 'macstyle-appfollow')
+STATE_FILE = os.path.join(STATE_DIR, 'state.json')
+BACKUP_DIR = os.path.join(STATE_DIR, 'backup')
+
+KIND_NAMES = {
+    'vscode': 'VS Code family',
+    'electron': 'Electron app',
+    'chromium': 'Chromium browser',
+    'gecko': 'Firefox family',
+    'cef': 'CEF app',
+    'flatpak': 'Flatpak app',
+}
+ACT_ON = ('vscode', 'electron', 'chromium')
+
+# Chromium browsers: install folder -> (config folder under XDG_CONFIG_HOME, tested).
+# Only Chrome is tested (2026-10-12). For the others the folder is from memory: they are written
+# once their folder exists, and nothing is created ahead of their first start.
+CHROMIUM_CONFIG = {
+    '/opt/google/chrome': ('google-chrome', True),
+    '/opt/google/chrome-beta': ('google-chrome-beta', False),
+    '/opt/google/chrome-unstable': ('google-chrome-unstable', False),
+    '/usr/lib64/chromium-browser': ('chromium', False),
+    '/opt/brave.com/brave': ('BraveSoftware/Brave-Browser', False),
+    '/opt/microsoft/msedge': ('microsoft-edge', False),
+    '/opt/vivaldi': ('vivaldi', False),
+}
+VSCODE_SETTINGS = (('window.titleBarStyle', 'native'), ('window.customTitleBarVisibility', 'never'))
+
+# Programs are looked up the way GNOME Shell starts them: its PATH has no folder in the home.
+PATH_DIRS = []
+for _d in os.environ.get('PATH', '').split(':') + ['/usr/local/bin', '/usr/bin', '/bin',
+                                                    '/usr/local/sbin', '/usr/sbin', '/sbin']:
+    if _d and os.path.isabs(_d) and not _d.startswith(HOME + '/') and _d not in PATH_DIRS:
+        PATH_DIRS.append(_d)
+
+
+def short(path):
+    return '~' + path[len(HOME):] if path.startswith(HOME + '/') else path
+
+
+def source_dirs():
+    env = os.environ.get('XDG_DATA_DIRS')
+    dirs = env.split(':') if env else [os.path.join(DATA_HOME, 'flatpak', 'exports', 'share'),
+                                       '/var/lib/flatpak/exports/share', '/usr/local/share', '/usr/share']
+    out, home = [], os.path.normpath(DATA_HOME)
+    for d in dirs:
+        d = os.path.normpath(d) if d else ''
+        if d and d != home and d not in out:
+            out.append(d)
+    return out
+
+
+def scan_sources():
+    """{desktop id: path}, the first file of each id in XDG_DATA_DIRS order (the one GNOME uses)."""
+    found = {}
+    for d in source_dirs():
+        root = os.path.join(d, 'applications')
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for f in sorted(filenames):
+                if f.endswith('.desktop'):
+                    path = os.path.join(dirpath, f)
+                    found.setdefault(os.path.relpath(path, root).replace('/', '-'), path)
+    return found
+
+
+def fingerprint():
+    out = []
+    for d in source_dirs():
+        for dirpath, dirnames, _ in os.walk(os.path.join(d, 'applications')):
+            try:
+                out.append((dirpath, os.stat(dirpath).st_mtime_ns))
+            except OSError:
+                pass
+    return out
+
+
+# --- desktop files -------------------------------------------------------------------------------
+
+ESCAPES = {'s': ' ', 'n': '\n', 't': '\t', 'r': '\r', '\\': '\\'}
+EXEC_RE = re.compile(r'(Exec[ \t]*=[ \t]*)(.*?)(\r?\n)?\Z', re.S)
+
+
+def read_file(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    return data, data.decode('utf-8', 'surrogateescape')
+
+
+def main_group(text):
+    """Keys of the [Desktop Entry] group."""
+    group, keys = None, {}
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith('['):
+            group = s[1:s.find(']')] if ']' in s else s[1:]
+        elif group == 'Desktop Entry' and '=' in s and not s.startswith('#'):
+            k, v = s.split('=', 1)
+            keys.setdefault(k.strip(), v.strip())
+    return keys
+
+
+def unescape_string(raw):
+    """Desktop-file string escapes undone; pos[i] is where character i starts in raw."""
+    out, pos, i = [], [], 0
+    while i < len(raw):
+        if raw[i] == '\\' and i + 1 < len(raw) and raw[i + 1] in ESCAPES:
+            out.append(ESCAPES[raw[i + 1]])
+            pos.append(i)
+            i += 2
+        else:
+            out.append(raw[i])
+            pos.append(i)
+            i += 1
+    pos.append(len(raw))
+    return ''.join(out), pos
+
+
+def exec_words(value):
+    """Words of an Exec value as (start, end, text), with the spec's double quotes and escapes."""
+    words, i, n = [], 0, len(value)
+    while i < n:
+        if value[i] in ' \t\n':
+            i += 1
+            continue
+        start, buf = i, []
+        while i < n and value[i] not in ' \t\n':
+            if value[i] == '"':
+                i += 1
+                while i < n and value[i] != '"':
+                    if value[i] == '\\' and i + 1 < n and value[i + 1] in '"`$\\':
+                        i += 1
+                    buf.append(value[i])
+                    i += 1
+                i += 1
+            else:
+                buf.append(value[i])
+                i += 1
+        words.append((start, min(i, n), ''.join(buf)))
+    return words
+
+
+def program_index(words):
+    """Index of the program word, after an "env NAME=VALUE ..." prefix; None if not found."""
+    k = 0
+    if words and os.path.basename(words[0][2]) == 'env':
+        k = 1
+        while k < len(words):
+            w = words[k][2]
+            if w in ('-i', '--ignore-environment', '-0', '--null'):
+                k += 1
+            elif w in ('-u', '--unset'):
+                k += 2
+            elif w.startswith('-'):
+                return None
+            elif '=' in w:
+                k += 1
+            else:
+                break
+    return k if k < len(words) else None
+
+
+def resolve_program(word):
+    if '/' in word:
+        path = word if os.path.isabs(word) else None
+    else:
+        path = next((os.path.join(d, word) for d in PATH_DIRS
+                     if os.path.isfile(os.path.join(d, word)) and os.access(os.path.join(d, word), os.X_OK)), None)
+    return os.path.realpath(path) if path and os.path.exists(path) else None
+
+
+def script_paths(path):
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(65536)
+    except OSError:
+        return []
+    if not head.startswith(b'#!'):
+        return []
+    text = head.decode('utf-8', 'replace')
+    return re.findall(r'(?<![\w$/])(/(?:[\w.+-]+/)*[\w.+-]+)', text)
+
+
+def vscode_product(d):
+    try:
+        with open(os.path.join(d, 'resources', 'app', 'product.json'), encoding='utf-8') as f:
+            p = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return p if isinstance(p, dict) and p.get('nameShort') and p.get('dataFolderName') else None
+
+
+def kind_of(d):
+    def has(*p):
+        return os.path.exists(os.path.join(d, *p))
+    if has('libxul.so'):
+        return 'gecko'
+    if has('libcef.so'):
+        return 'cef'
+    if not (has('chrome_100_percent.pak') or (has('resources.pak') and has('icudtl.dat'))):
+        return None
+    if vscode_product(d):
+        return 'vscode'
+    if has('resources', 'app.asar') or has('resources', 'app'):
+        return 'electron'
+    return 'chromium'
+
+
+def detect(real):
+    """(install folder, kind) of a program, from the files next to it; (None, None) if none fits."""
+    first = os.path.dirname(real)
+    cands = [first]
+    if os.path.basename(first) == 'bin':            # e.g. /usr/share/code/bin/code
+        cands.append(os.path.dirname(first))
+    name = os.path.basename(real)
+    for p in script_paths(real):                    # e.g. Fedora's /usr/bin/firefox: /usr/lib64 + firefox
+        for c in (p, os.path.join(p, name)):
+            if os.path.basename(c) == name and os.path.isdir(c):
+                cands.append(os.path.realpath(c))
+    seen = set()
+    for d in cands:
+        if d not in seen:
+            seen.add(d)
+            k = kind_of(d)
+            if k:
+                return d, k
+    return None, None
+
+
+def classify(did, path):
+    """What a launcher starts: a dict, or None for launchers this tool has nothing to say about."""
+    try:
+        data, text = read_file(path)
+    except OSError:
+        return None
+    keys = main_group(text)
+    if keys.get('Type') != 'Application' or keys.get('Hidden', '').lower() == 'true' or 'Exec' not in keys:
+        return None
+    app = {'id': did, 'path': path, 'data': data, 'text': text, 'name': keys.get('Name', did),
+           'dbus': keys.get('DBusActivatable', '').lower() == 'true'}
+    words = exec_words(unescape_string(keys['Exec'])[0])
+    k = program_index(words)
+    if k is None:
+        return None
+    prog = words[k][2]
+    if os.path.basename(prog) == 'flatpak' and 'run' in [w[2] for w in words[k + 1:]]:
+        refs = [w[2] for w in words[k + 2:] if not w[2].startswith('-')]
+        app.update(kind='flatpak', dir=refs[0] if refs else '?')
+        return app
+    real = resolve_program(prog)
+    if not real:
+        app.update(kind=None, missing=prog)
+        return app
+    d, kind = detect(real)
+    if not kind:
+        return None
+    app.update(kind=kind, dir=d, program=real)
+    if kind == 'vscode':
+        app['product'] = vscode_product(d)
+    return app
+
+
+def add_flag(line, app_dir):
+    """An Exec line with FLAG after its program; (line, None) or (unchanged line, reason)."""
+    m = EXEC_RE.match(line)
+    raw = m.group(2)
+    value, pos = unescape_string(raw)
+    words = exec_words(value)
+    k = program_index(words)
+    if k is None:
+        return line, 'no program found'
+    if any(w[2] == '--ozone-platform' or w[2].startswith('--ozone-platform=') for w in words):
+        return line, 'has its own --ozone-platform'
+    real = resolve_program(words[k][2])
+    if not real or detect(real)[0] != app_dir:
+        return line, 'starts another program'
+    at = m.start(2) + pos[words[k][1]]
+    return line[:at] + ' ' + FLAG + line[at:], None
+
+
+def make_copy(app):
+    out, notes = [], []
+    for ln in app['text'].splitlines(keepends=True):
+        if EXEC_RE.match(ln):
+            ln, why = add_flag(ln, app['dir'])
+            if why:
+                notes.append('Exec line left as it is (' + why + '): ' + ln.strip())
+        out.append(ln)
+    sha = hashlib.sha256(app['data']).hexdigest()
+    head = (MARK + app['path'] + ' (sha256 ' + sha + ')\n'
+            '# with ' + FLAG + ' on each Exec line: the app runs as an X11 client, so its menu and window buttons\n'
+            '# go to the top bar. Rewritten when the source changes, deleted when it is gone. To keep a version of your\n'
+            '# own, delete these four lines. To stop this for the app: macstyle-appfollow --skip ' + app['id'] + '\n')
+    return head + ''.join(out), notes
+
+
+def our_source(path):
+    """Source path named by this tool's marker, or None for a file that is not this tool's copy."""
+    try:
+        with open(path, encoding='utf-8', errors='surrogateescape') as f:
+            first = f.readline()
+    except OSError:
+        return None
+    return first[len(MARK):].split(' (sha256 ')[0] if first.startswith(MARK) else None
+
+
+def body(text):
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and (lines[i].startswith('#') or not lines[i].strip()):
+        i += 1
+    return ''.join(lines[i:])
+
+
+def write_atomic(path, text, mode=None):
+    tmp = path + '.macstyle-appfollow.tmp'
+    with open(tmp, 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
+        f.write(text)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# --- settings ------------------------------------------------------------------------------------
+
+def jsonc_to_json(text):
+    """VS Code's settings.json (comments, trailing commas) as plain JSON."""
+    out, i, n = [], 0, len(text)
+
+    def skip_blank(j):
+        while j < n:
+            if text.startswith('//', j):
+                k = text.find('\n', j)
+                j = n if k < 0 else k
+            elif text.startswith('/*', j):
+                k = text.find('*/', j + 2)
+                j = n if k < 0 else k + 2
+            elif text[j] in ' \t\r\n':
+                j += 1
+            else:
+                break
+        return j
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith('//', i) or text.startswith('/*', i):
+            j = skip_blank(i)
+            out.append(' ')
+            i = j
+        elif c == ',' and skip_blank(i + 1) < n and text[skip_blank(i + 1)] in '}]':
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
+def first_brace(text):
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            i = j + 1
+        elif text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+        elif text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+        elif text[i] == '{':
+            return i
+        else:
+            i += 1
+    return -1
+
+
+def running(app_dir):
+    """True while a process of this user runs a program from the app's install folder."""
+    me = os.getuid()
+    for e in os.listdir('/proc'):
+        if not e.isdigit():
+            continue
+        try:
+            if os.stat('/proc/' + e).st_uid != me:
+                continue
+            exe = os.readlink('/proc/' + e + '/exe')
+        except OSError:
+            continue
+        exe = exe.removesuffix(' (deleted)')
+        if exe.startswith(app_dir + '/') and 'crashpad' not in os.path.basename(exe):
+            return True
+    return False
+
+
+def backup_once(path):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dst = os.path.join(BACKUP_DIR, path.strip('/').replace('/', '%'))
+    if not os.path.exists(dst):
+        shutil.copy2(path, dst)
+
+
+class Run:
+    def __init__(self, dry, verbose=False):
+        self.dry = dry
+        self.verbose = dry or verbose
+        self.state = self.load_state()
+        self.changed = False
+        self.waiting = False
+
+    @staticmethod
+    def load_state():
+        try:
+            with open(STATE_FILE, encoding='utf-8') as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = {}
+        st.setdefault('skip', [])
+        st.setdefault('settings', {})
+        return st
+
+    def save_state(self):
+        if self.dry or not self.changed:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        write_atomic(STATE_FILE, json.dumps(self.state, indent=1, sort_keys=True) + '\n')
+
+    def note(self, path, key, what):
+        self.state['settings'][path + '#' + key] = what + ', ' + time.strftime('%Y-%m-%d %H:%M')
+        self.changed = True
+
+    def done(self, path, key):
+        return (path + '#' + key) in self.state['settings']
+
+    def say(self, *lines):
+        for ln in lines:
+            print(ln, flush=True)
+
+    def info(self, *lines):
+        if self.verbose:
+            self.say(*lines)
+
+    # launchers
+
+    def launchers(self, apps):
+        wanted = set()
+        for app in apps:
+            if app.get('kind') not in ACT_ON:
+                continue
+            did = app['id']
+            head = '%-40s %s, %s' % (did, KIND_NAMES[app['kind']], app['dir'])
+            if did in self.state['skip']:
+                self.info(head, '  launcher: skipped (macstyle-appfollow --skip)')
+                continue
+            wanted.add(did)
+            content, notes = make_copy(app)
+            dst = os.path.join(TARGET, did)
+            if os.path.lexists(dst):
+                try:
+                    cur = read_file(dst)[1]
+                except OSError:
+                    cur = None
+                if our_source(dst) is not None:
+                    act = 'up to date' if cur == content else 'rewrite (source or rule changed)'
+                elif cur is not None and body(cur) == body(content):
+                    act = 'take over (a copy with the same lines, without the marker)'
+                else:
+                    act = None
+                    self.info(head, '  launcher: ' + short(dst) + ' is the user\'s own copy, left alone')
+            else:
+                act = 'create'
+            if act == 'up to date':
+                self.info(head, '  launcher: up to date ' + short(dst))
+            elif act:
+                self.say(head, '  launcher: ' + act + ' ' + short(dst))
+                self.say(*['    ' + ln.strip() for ln in content.splitlines() if EXEC_RE.match(ln)])
+                if not self.dry:
+                    os.makedirs(TARGET, exist_ok=True)
+                    write_atomic(dst, content, 0o644)
+            self.info(*['  ' + n for n in notes])
+            if app['dbus']:
+                self.info('  note: DBusActivatable=true, GNOME may start it without the Exec line')
+        if os.path.isdir(TARGET):
+            for f in sorted(os.listdir(TARGET)):
+                path = os.path.join(TARGET, f)
+                if f.endswith('.desktop') and f not in wanted and our_source(path) is not None:
+                    self.say('%-40s launcher: delete %s (source %s gone, skipped or no longer such an app)'
+                             % (f, short(path), our_source(path)))
+                    if not self.dry:
+                        os.remove(path)
+
+    # settings
+
+    def settings(self, apps):
+        seen = set()
+        for app in apps:
+            if app.get('kind') in ('vscode', 'chromium') and app['dir'] not in seen and app['id'] not in self.state['skip']:
+                seen.add(app['dir'])
+                if app['kind'] == 'vscode':
+                    self.vscode(app)
+                else:
+                    self.chromium(app)
+
+    def vscode(self, app):
+        path = os.path.join(CONFIG_HOME, app['product']['nameShort'], 'User', 'settings.json')
+        todo = [(k, v) for k, v in VSCODE_SETTINGS if not self.done(path, k)]
+        head = '  setting: ' + short(path) + ' '
+        if not todo:
+            self.info(head + 'done earlier')
+            return
+        if os.path.exists(path):
+            try:
+                text = read_file(path)[1]
+                data = json.loads(jsonc_to_json(text))
+                assert isinstance(data, dict)
+            except (OSError, ValueError, AssertionError):
+                self.say(head + 'could not be read, not changed')
+                return
+        else:
+            text, data = None, {}
+        add = []
+        for k, v in todo:
+            if k in data:
+                self.say(head + '%s: already %s, noted' % (k, json.dumps(data[k])))
+                if not self.dry:
+                    self.note(path, k, 'found ' + json.dumps(data[k]))
+            else:
+                add.append((k, v))
+        if not add:
+            return
+        if running(app['dir']):
+            self.say(head + ', '.join(k for k, _ in add) + ': waiting, the app is running')
+            self.waiting = True
+            return
+        self.say(head + ', '.join('%s: set %s' % (k, json.dumps(v)) for k, v in add)
+                 + (' (new file)' if text is None else ''))
+        if self.dry:
+            return
+        if text is None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            new = '{\n' + ',\n'.join('    %s: %s' % (json.dumps(k), json.dumps(v)) for k, v in add) + '\n}\n'
+        else:
+            at = first_brace(text)
+            after = text[at + 1:]
+            m = re.search(r'\n([ \t]+)\S', after)
+            indent = m.group(1) if m else '    '
+            lines = ''.join('\n%s%s: %s,' % (indent, json.dumps(k), json.dumps(v)) for k, v in add)
+            new = text[:at + 1] + (lines if data else lines[:-1]) + after
+            check = json.loads(jsonc_to_json(new))
+            if any(check.get(k) != v for k, v in add) or len(check) != len(data) + len(add):
+                self.say(head + 'edit did not check out, not written')
+                return
+            backup_once(path)
+        write_atomic(path, new, os.stat(path).st_mode & 0o7777 if text is not None else 0o644)
+        for k, v in add:
+            self.note(path, k, 'set ' + json.dumps(v))
+
+    def chromium(self, app):
+        entry = CHROMIUM_CONFIG.get(app['dir'])
+        if not entry:
+            self.info('  setting: config folder unknown, launcher only (in the browser: Settings > Appearance >'
+                     ' "Use system title bar and borders")')
+            return
+        sub, tested = entry
+        base = os.path.join(CONFIG_HOME, sub)
+        key = 'browser.custom_chrome_frame'
+        try:
+            with open(os.path.join(base, 'Local State'), encoding='utf-8') as f:
+                profiles = sorted(json.load(f).get('profile', {}).get('info_cache', {}))
+        except (OSError, ValueError, AttributeError):
+            profiles = []
+        is_running = running(app['dir'])
+        if not profiles and not os.path.exists(os.path.join(base, 'Default')):
+            path = os.path.join(base, 'Default', 'Preferences')
+            if not tested or self.done(path, key):
+                self.info('  setting: ' + short(base) + ' not there yet' + ('' if tested else ' (folder untested)'))
+            elif is_running:
+                self.say('  setting: ' + short(path) + ' waiting, the browser is running')
+                self.waiting = True
+            else:
+                self.say('  setting: ' + short(path) + ' %s: set false (new file, before the first start)' % key)
+                if not self.dry:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    write_atomic(path, '{"browser":{"custom_chrome_frame":false}}', 0o600)
+                    self.note(path, key, 'set false (new file)')
+            return
+        for p in profiles:
+            path = os.path.join(base, p, 'Preferences')
+            head = '  setting: ' + short(path) + ' '
+            if self.done(path, key):
+                self.info(head + 'done earlier')
+                continue
+            try:
+                with open(path, encoding='utf-8') as f:
+                    prefs = json.load(f)
+                browser = prefs.setdefault('browser', {})
+            except (OSError, ValueError, AttributeError):
+                self.say(head + 'not readable yet, later')
+                continue
+            if key.split('.')[1] in browser:
+                cur = browser[key.split('.')[1]]
+                self.say(head + '%s: already %s, noted' % (key, json.dumps(cur)))
+                if not self.dry:
+                    self.note(path, key, 'found ' + json.dumps(cur))
+                continue
+            if is_running:
+                self.say(head + 'waiting, the browser is running')
+                self.waiting = True
+                continue
+            self.say(head + '%s: set false' % key)
+            if not self.dry:
+                backup_once(path)
+                browser['custom_chrome_frame'] = False
+                write_atomic(path, json.dumps(prefs, ensure_ascii=False, separators=(',', ':')),
+                             os.stat(path).st_mode & 0o7777)
+                self.note(path, key, 'set false')
+
+
+def scan_once(run):
+    apps = [a for a in (classify(did, p) for did, p in sorted(scan_sources().items())) if a]
+    run.launchers(apps)
+    run.settings(apps)
+    others = [a for a in apps if a.get('kind') not in ACT_ON]
+    for a in others:
+        if a.get('kind'):
+            run.info('%-40s %s, %s: no rule yet, nothing done' % (a['id'], KIND_NAMES[a['kind']], a['dir']))
+        else:
+            run.info('%-40s program %s not found (yet), nothing done' % (a['id'], a['missing']))
+    run.save_state()
+    return any(a.get('missing') for a in others)
+
+
+def main(argv):
+    dry = '--dry-run' in argv
+    verbose = '--verbose' in argv
+    run = Run(dry, verbose)
+    for opt in ('--skip', '--unskip'):
+        if opt in argv:
+            did = argv[argv.index(opt) + 1]
+            if not did.endswith('.desktop'):
+                did += '.desktop'
+            if opt == '--skip' and did not in run.state['skip']:
+                run.state['skip'].append(did)
+            elif opt == '--unskip' and did in run.state['skip']:
+                run.state['skip'].remove(did)
+            run.changed = True
+    if '--settle' not in argv:
+        scan_once(run)
+        return 0
+    time.sleep(float(argv[argv.index('--settle') + 1]))
+    for _ in range(12):                             # at most about a minute of follow-up scans
+        before = fingerprint()
+        missing = scan_once(run)
+        if fingerprint() == before and not missing:
+            break
+        time.sleep(5)
+        run = Run(dry, verbose)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

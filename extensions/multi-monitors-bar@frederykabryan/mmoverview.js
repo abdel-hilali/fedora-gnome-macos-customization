@@ -1,0 +1,1804 @@
+/*
+Copyright (C) 2025-2026  Frederyk Abryan Palinoan
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, visit https://www.gnu.org/licenses/.
+*/
+
+import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
+import St from 'gi://St';
+import Shell from 'gi://Shell';
+import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Params from 'resource:///org/gnome/shell/misc/params.js';
+import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
+import * as OverviewControls from 'resource:///org/gnome/shell/ui/overviewControls.js';
+import * as Overview from 'resource:///org/gnome/shell/ui/overview.js';
+import * as SearchController from 'resource:///org/gnome/shell/ui/searchController.js';
+import * as LayoutManager from 'resource:///org/gnome/shell/ui/layout.js';
+import * as Background from 'resource:///org/gnome/shell/ui/background.js';
+import * as WorkspacesView from 'resource:///org/gnome/shell/ui/workspacesView.js';
+import * as AppDisplay from 'resource:///org/gnome/shell/ui/appDisplay.js';
+import * as Search from 'resource:///org/gnome/shell/ui/search.js';
+import { gettext as _ } from 'resource:///org/gnome/shell/extensions/extension.js';
+
+import * as MultiMonitors from './extension.js';
+import * as Common from './common.js';
+import { shellVersion } from './common.js';
+import * as Constants from './mmPanelConstants.js';
+
+// Re-export for backward compatibility
+export const setMMPanelArrayRef = Constants.setMMPanelArrayRef;
+
+export const THUMBNAILS_SLIDER_POSITION_ID = 'thumbnails-slider-position';
+
+// Vertical spacing of the overview as a share of its height: the value of
+// VERTICAL_SPACING_RATIO in overviewControls.js, which does not export it.
+const VERTICAL_SPACING_RATIO = 0.02;
+// Padding around the search entry and the content area, in pixels.
+const OVERVIEW_GROUP_PADDING = 30;
+
+class MultiMonitorsWorkspaceThumbnailClass extends St.Widget {
+    _init(metaWorkspace, monitorIndex) {
+        super._init({
+            clip_to_allocation: true,
+            style_class: 'workspace-thumbnail',
+        });
+        this._delegate = this;
+
+        this.metaWorkspace = metaWorkspace;
+        this.monitorIndex = monitorIndex;
+
+        this._removed = false;
+
+        this._contents = new Clutter.Actor({
+            name: 'mm-workspace-thumbnail-contents',
+            clip_to_allocation: true,
+        });
+        this.add_child(this._contents);
+
+        // Initialize _viewport for GNOME 46 compatibility
+        this._viewport = new Clutter.Actor({
+            name: 'mm-workspace-thumbnail-viewport',
+            clip_to_allocation: true,
+        });
+        this._contents.add_child(this._viewport);
+
+
+        this._createBackground();
+
+        let workArea = Main.layoutManager.getWorkAreaForMonitor(this.monitorIndex);
+        this.setPorthole(workArea.x, workArea.y, workArea.width, workArea.height);
+        this._contents.set_size(workArea.width, workArea.height);
+        this._viewport.set_size(workArea.width, workArea.height);
+
+        let windows = global.get_window_actors().filter(actor => {
+            let win = actor.meta_window;
+            return win.located_on_workspace(metaWorkspace);
+        });
+
+        // Create clones for windows that should be visible in the Overview
+        this._windows = [];
+        this._allWindows = [];
+        for (let i = 0; i < windows.length; i++) {
+            this._allWindows.push(windows[i].meta_window);
+            windows[i].meta_window.connectObject('notify::minimized',
+                this._updateMinimized.bind(this), this);
+
+            if (this._isMyWindow(windows[i]) && this._isOverviewWindow(windows[i]))
+                this._addWindowClone(windows[i]);
+        }
+
+        // Track window changes. connectObject ties these handlers on the
+        // surviving metaWorkspace / global.display to this thumbnail's lifetime
+        // so they auto-disconnect on destroy (including C-side teardown).
+        this.metaWorkspace.connectObject(
+            'window-added', this._windowAdded.bind(this),
+            'window-removed', this._windowRemoved.bind(this),
+            this);
+        global.display.connectObject(
+            'window-entered-monitor', this._windowEnteredMonitor.bind(this),
+            'window-left-monitor', this._windowLeftMonitor.bind(this),
+            this);
+
+        this.state = WorkspaceThumbnail.ThumbnailState.NORMAL;
+        this._slidePosition = 0; // Fully slid in
+        this._collapseFraction = 0; // Not collapsed
+    }
+
+    vfunc_allocate(box) {
+        this.set_allocation(box);
+
+        const childBox = new Clutter.ActorBox();
+        childBox.set_origin(0, 0);
+        childBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
+
+        if (this._contents)
+            this._contents.allocate(childBox);
+        if (this._viewport)
+            this._viewport.allocate(childBox);
+
+        const upstreamAllocate = WorkspaceThumbnail.WorkspaceThumbnail.prototype.vfunc_allocate;
+        if (upstreamAllocate) {
+            upstreamAllocate.call(this, box);
+        }
+    }
+
+    _createBackground() {
+        this._bgManager = new Background.BackgroundManager({
+            monitorIndex: this.monitorIndex,
+            container: this._contents,
+            vignette: false
+        });
+    }
+
+    destroy() {
+        // All handlers below were connected with connectObject(..., this);
+        // disconnectObject(this) removes them in one call (and GJS also
+        // auto-disconnects on destroy).
+        this.metaWorkspace.disconnectObject(this);
+        global.display.disconnectObject(this);
+        for (const metaWindow of this._allWindows)
+            metaWindow.disconnectObject(this);
+        this._allWindows = [];
+
+        if (this._bgManager) {
+            this._bgManager.destroy();
+            this._bgManager = null;
+        }
+
+        // In GNOME 40+, WorkspaceThumbnail has a destroy method we copied,
+        // but we override it here. To call the one we copied, we'd need access
+        // to it. St.Widget.prototype.destroy.call(this) is the safest base call,
+        // but WorkspaceThumbnail's own logic won't be executed unless we do a trick.
+        // We will just let copyClass handle it if possible, but actually since we define
+        // destroy() here, copyClass will see it and NOT overwrite it, so WorkspaceThumbnail's
+        // destroy gets shadowed.
+        // Let's call the upstream destroy logic by accessing WorkspaceThumbnail.WorkspaceThumbnail.prototype.destroy
+        if (WorkspaceThumbnail.WorkspaceThumbnail.prototype.destroy) {
+            WorkspaceThumbnail.WorkspaceThumbnail.prototype.destroy.call(this);
+        } else {
+            super.destroy();
+        }
+    }
+}
+
+Common.copyClass(WorkspaceThumbnail.WorkspaceThumbnail, MultiMonitorsWorkspaceThumbnailClass);
+export const MultiMonitorsWorkspaceThumbnail = GObject.registerClass({
+    Properties: {
+        'collapse-fraction': GObject.ParamSpec.double(
+            'collapse-fraction', 'collapse-fraction', 'collapse-fraction',
+            GObject.ParamFlags.READWRITE,
+            0, 1, 0),
+        'slide-position': GObject.ParamSpec.double(
+            'slide-position', 'slide-position', 'slide-position',
+            GObject.ParamFlags.READWRITE,
+            0, 1, 0),
+    },
+}, MultiMonitorsWorkspaceThumbnailClass);
+
+class MultiMonitorsThumbnailsBoxClass extends St.Widget {
+    _init(scrollAdjustment, monitorIndex, settings) {
+
+        super._init({
+            reactive: true,
+            style_class: 'workspace-thumbnails',
+            request_mode: Clutter.RequestMode.WIDTH_FOR_HEIGHT
+        });
+
+        this._delegate = this;
+        this._monitorIndex = monitorIndex;
+        this._extensionSettings = settings;
+        // Cleanup MUST run from the `destroy` SIGNAL: on a C-side teardown
+        // (monitor removed on resume) the destroy() method is bypassed, leaving
+        // handlers on Main.overview / Main.layoutManager / global.display live.
+        this.connect('destroy', () => this._disconnectAll());
+
+        // Methods copied from GNOME Shell's ThumbnailsBox expect _settings to
+        // point at org.gnome.mutter. Keep extension preferences separate so
+        // upstream code does not query mutter keys from our extension schema.
+        this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
+        this._settings = this._mutterSettings;
+
+        let indicator = new St.Bin({ style_class: 'workspace-thumbnail-indicator' });
+
+        // We don't want the indicator to affect drag-and-drop
+        Shell.util_set_hidden_from_pick(indicator, true);
+
+        this._indicator = indicator;
+        this.add_child(indicator);
+
+        // The porthole is the part of the screen we're showing in the thumbnails
+        this._porthole = {
+            width: global.stage.width, height: global.stage.height,
+            x: global.stage.x, y: global.stage.y
+        };
+
+        this._dropWorkspace = -1;
+        this._dropPlaceholderPos = -1;
+        this._dropPlaceholder = new St.Bin({ style_class: 'placeholder' });
+        this.add_child(this._dropPlaceholder);
+        this._spliceIndex = -1;
+
+        this._targetScale = 0;
+        this._scale = 0;
+        this._pendingScaleUpdate = false;
+        this._stateUpdateQueued = false;
+        this._animatingIndicator = false;
+
+        this._stateCounts = {};
+        for (let key in WorkspaceThumbnail.ThumbnailState)
+            this._stateCounts[WorkspaceThumbnail.ThumbnailState[key]] = 0;
+
+        this._thumbnails = [];
+
+        // connectObject(..., this) ties all of these handlers on surviving
+        // objects (Main.overview, mutter settings, Main.layoutManager,
+        // global.display, scrollAdjustment) to this box's lifetime so they
+        // auto-disconnect on destroy, including C-side teardown on resume.
+        Main.overview.connectObject(
+            'showing', this._createThumbnails.bind(this),
+            'hidden', this._destroyThumbnails.bind(this),
+            'item-drag-begin', this._onDragBegin.bind(this),
+            'item-drag-end', this._onDragEnd.bind(this),
+            'item-drag-cancelled', this._onDragCancelled.bind(this),
+            'window-drag-begin', this._onDragBegin.bind(this),
+            'window-drag-end', this._onDragEnd.bind(this),
+            'window-drag-cancelled', this._onDragCancelled.bind(this),
+            this);
+
+        if (this._mutterSettings.settings_schema.has_key('dynamic-workspaces')) {
+            this._mutterSettings.connectObject('changed::dynamic-workspaces',
+                this._updateSwitcherVisibility.bind(this), this);
+        }
+
+        Main.layoutManager.connectObject('monitors-changed', () => {
+            this._destroyThumbnails();
+            if (Main.overview.visible)
+                this._createThumbnails();
+        }, this);
+
+        global.display.connectObject('workareas-changed',
+            this._updatePorthole.bind(this), this);
+
+        this._switchWorkspaceNotifyId = 0;
+        this._nWorkspacesNotifyId = 0;
+        this._syncStackingId = 0;
+        this._workareasChangedId = 0;
+
+        this._scrollAdjustment = scrollAdjustment;
+
+        this._scrollAdjustment.connectObject('notify::value', adj => {
+            let workspaceManager = global.workspace_manager;
+            let activeIndex = workspaceManager.get_active_workspace_index();
+
+            this._animatingIndicator = adj.value !== activeIndex;
+
+            if (!this._animatingIndicator)
+                this._queueUpdateStates();
+
+            this.queue_relayout();
+        }, this);
+    }
+
+    _disconnectAll() {
+        this._destroyThumbnails();
+        // All handlers were connected with connectObject(..., this).
+        this._scrollAdjustment.disconnectObject(this);
+        Main.overview.disconnectObject(this);
+        this._mutterSettings.disconnectObject(this);
+        Main.layoutManager.disconnectObject(this);
+        global.display.disconnectObject(this);
+    }
+
+    addThumbnails(start, count) {
+        let workspaceManager = global.workspace_manager;
+
+        // Validate porthole before creating thumbnails to prevent NaN/zero dimension errors
+        if (!this._porthole || this._porthole.width <= 0 || this._porthole.height <= 0) {
+            this._updatePorthole();
+            if (!this._porthole || this._porthole.width <= 0 || this._porthole.height <= 0) {
+                console.debug('[Multi Monitors Add-On] Invalid porthole dimensions, skipping thumbnail creation');
+                return;
+            }
+        }
+
+        for (let k = start; k < start + count; k++) {
+            let metaWorkspace = workspaceManager.get_workspace_by_index(k);
+            let thumbnail = new MultiMonitorsWorkspaceThumbnail(metaWorkspace, this._monitorIndex);
+            thumbnail.setPorthole(this._porthole.x, this._porthole.y,
+                this._porthole.width, this._porthole.height);
+            this._thumbnails.push(thumbnail);
+            this.add_child(thumbnail);
+
+            if (start > 0 && this._spliceIndex == -1) {
+                // not the initial fill, and not splicing via DND
+                thumbnail.state = WorkspaceThumbnail.ThumbnailState.NEW;
+                thumbnail.slide_position = 1; // start slid out
+                this._haveNewThumbnails = true;
+            } else {
+                thumbnail.state = WorkspaceThumbnail.ThumbnailState.NORMAL;
+            }
+
+            this._stateCounts[thumbnail.state]++;
+        }
+
+        this._queueUpdateStates();
+
+        // The thumbnails indicator actually needs to be on top of the thumbnails
+        this.set_child_above_sibling(this._indicator, null);
+
+        // Clear the splice index, we got the message
+        this._spliceIndex = -1;
+    }
+
+    _updatePorthole() {
+        this._porthole = Main.layoutManager.getWorkAreaForMonitor(this._monitorIndex);
+        this.queue_relayout();
+    }
+
+    _updateSwitcherVisibility() {
+        // Fallback implementation: Update thumbnail box visibility based on
+        // dynamic workspaces setting. This is called when the user changes
+        // the org.gnome.mutter dynamic-workspaces setting.
+        // The upstream implementation may differ; this is a minimal fallback.
+        if (!this._mutterSettings) return;
+
+        // If dynamic workspaces are disabled and we only have one workspace,
+        // we might want to hide the switcher. For now, keep it simple.
+        // Upstream logic is more complex; this just prevents crashes.
+    }
+}
+
+Common.copyClass(WorkspaceThumbnail.ThumbnailsBox, MultiMonitorsThumbnailsBoxClass);
+export const MultiMonitorsThumbnailsBox = GObject.registerClass({
+    Properties: {
+        'indicator-y': GObject.ParamSpec.double(
+            'indicator-y', 'indicator-y', 'indicator-y',
+            GObject.ParamFlags.READWRITE,
+            0, Infinity, 0),
+        'scale': GObject.ParamSpec.double(
+            'scale', 'scale', 'scale',
+            GObject.ParamFlags.READWRITE,
+            0, Infinity, 0),
+        // Required by methods copied from ThumbnailsBox via copyClass
+        'should-show': GObject.ParamSpec.boolean(
+            'should-show', 'should-show', 'should-show',
+            GObject.ParamFlags.READWRITE,
+            true),
+    },
+}, MultiMonitorsThumbnailsBoxClass);
+
+/* This isn't compatible with GNOME 40 and i don't know how to fix it -- TH
+var MultiMonitorsSlidingControl = (() => {
+    let MultiMonitorsSlidingControl = class MultiMonitorsSlidingControl extends St.Widget {
+    _init(params) {
+        params = Params.parse(params, { slideDirection: OverviewControls.SlideDirection.LEFT });
+
+        this.layout = new OverviewControls.SlideLayout();
+        this.layout.slideDirection = params.slideDirection;
+        super._init({
+            layout_manager: this.layout,
+            style_class: 'overview-controls',
+            clip_to_allocation: true,
+        });
+
+        this._visible = true;
+        this._inDrag = false;
+
+        this._hidingId = Main.overview.connect('hiding', this._onOverviewHiding.bind(this));
+
+        this._itemDragBeginId = Main.overview.connect('item-drag-begin', this._onDragBegin.bind(this));
+        this._itemDragEndId = Main.overview.connect('item-drag-end', this._onDragEnd.bind(this));
+        this._itemDragCancelledId = Main.overview.connect('item-drag-cancelled', this._onDragEnd.bind(this));
+
+        this._windowDragBeginId = Main.overview.connect('window-drag-begin', this._onWindowDragBegin.bind(this));
+        this._windowDragCancelledId = Main.overview.connect('window-drag-cancelled', this._onWindowDragEnd.bind(this));
+        this._windowDragEndId = Main.overview.connect('window-drag-end', this._onWindowDragEnd.bind(this));
+    }
+
+    destroy() {
+        Main.overview.disconnect(this._hidingId);
+
+        Main.overview.disconnect(this._itemDragBeginId);
+        Main.overview.disconnect(this._itemDragEndId);
+        Main.overview.disconnect(this._itemDragCancelledId);
+
+        Main.overview.disconnect(this._windowDragBeginId);
+        Main.overview.disconnect(this._windowDragCancelledId);
+        Main.overview.disconnect(this._windowDragEndId);
+        super.destroy();
+    }};
+
+    Common.copyClass(OverviewControls.SlidingControl, MultiMonitorsSlidingControl);
+    return GObject.registerClass(MultiMonitorsSlidingControl);
+})();
+
+var MultiMonitorsThumbnailsSlider = (() => {
+    let MultiMonitorsThumbnailsSlider = class MultiMonitorsThumbnailsSlider extends MultiMonitorsSlidingControl {
+    _init(thumbnailsBox) {
+        super._init({ slideDirection: OverviewControls.SlideDirection.RIGHT });
+
+        this._thumbnailsBox = thumbnailsBox;
+
+        this.request_mode = Clutter.RequestMode.WIDTH_FOR_HEIGHT;
+        this.reactive = true;
+        this.track_hover = true;
+        this.add_child(this._thumbnailsBox);
+
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', this._updateSlide.bind(this));
+        this._activeWorkspaceChangedId = global.workspace_manager.connect('active-workspace-changed',
+                                         this._updateSlide.bind(this));
+        this._notifyNWorkspacesId = global.workspace_manager.connect('notify::n-workspaces',
+                                         this._updateSlide.bind(this));
+        this.connect('notify::hover', this._updateSlide.bind(this));
+        this._thumbnailsBox.bind_property('visible', this, 'visible', GObject.BindingFlags.SYNC_CREATE);
+    }
+
+    destroy() {
+        global.workspace_manager.disconnect(this._activeWorkspaceChangedId);
+        global.workspace_manager.disconnect(this._notifyNWorkspacesId);
+        Main.layoutManager.disconnect(this._monitorsChangedId);
+        super.destroy();
+    }};
+
+    Common.copyClass(OverviewControls.ThumbnailsSlider, MultiMonitorsThumbnailsSlider);
+    return GObject.registerClass(MultiMonitorsThumbnailsSlider);
+})();
+*/
+
+export const MultiMonitorsControlsManager = GObject.registerClass(
+    class MultiMonitorsControlsManager extends St.Widget {
+        _init(index, settings) {
+            this._monitorIndex = index;
+            this._settings = settings;
+            this._workspacesViews = null;
+            this._spacer_height = 0;
+            this._fixGeometry = 0;
+            this._visible = false;
+            this._destroying = false;
+            this._pendingTimeouts = [];  // Track all one-shot timeouts for cleanup
+            this._overviewStateAdjustment = null;
+            this._overviewStateChangedId = 0;
+            this._searchEntryDestroyId = 0;
+            this._lastAppDisplayLayout = null;
+            this._appDisplayVisible = false;
+            this._lastWorkspaceTransformKey = null;
+
+            // Use a simple BinLayout to ensure we have full control over the child placement
+            // The OverviewControls layouts are too complex and tied to primary monitor state
+            let layout = new Clutter.BinLayout();
+
+            super._init({
+                layout_manager: layout,
+                x_expand: true,
+                y_expand: true,
+                clip_to_allocation: true,
+            });
+
+            // Cleanup MUST run from the `destroy` SIGNAL, not only the destroy()
+            // method. When the overview is torn down from C code (e.g. a monitor
+            // disappears on resume from sleep) the destroy() override is bypassed,
+            // leaving handlers on Main.overview / Main.layoutManager / settings
+            // live to fire against disposed overview actors (PageIndicators,
+            // AppDisplay, SecondaryMonitorDisplay) — which crashes gnome-shell.
+            this.connect('destroy', () => this._disconnectAll());
+
+            this._workspaceAdjustment = Main.overview._overview._controls._workspaceAdjustment;
+
+            this._thumbnailsBox =
+                new MultiMonitorsThumbnailsBox(this._workspaceAdjustment, this._monitorIndex, this._settings);
+            //this._thumbnailsSlider = new MultiMonitorsThumbnailsSlider(this._thumbnailsBox);
+
+            // Create functional search entry
+            this._searchEntry = new St.Entry({
+                hint_text: 'Type to search...',
+                style_class: 'search-entry',
+                can_focus: true,
+                x_expand: false,
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'width: 400px; border-radius: 8px;',
+            });
+
+            this._searchEntryDestroyId = this._searchEntry.connect('destroy', actor => {
+                if (this._searchEntry === actor)
+                    this._searchEntry = null;
+                this._searchEntryDestroyId = 0;
+            });
+
+            // Connect search entry to filter app grid locally
+            this._searchEntry.clutter_text.connect('text-changed', actor => {
+                if (this._destroying)
+                    return;
+
+                const text = this._getSearchTextFromActor(actor);
+                // Filter the local app grid based on search text or app-grid state.
+                this._filterAppGrid(text);
+            });
+
+            // Handle Enter key to activate focused app
+            this._searchEntry.clutter_text.connect('activate', () => {
+                if (this._destroying)
+                    return;
+
+                if (this._focusedApp && this._focusedApp._appInfo) {
+                    this._launchApp(this._focusedApp._appInfo);
+                }
+            });
+
+            // Handle arrow keys to navigate between apps
+            this._searchEntry.clutter_text.connect('key-press-event', (actor, event) => {
+                if (this._destroying)
+                    return Clutter.EVENT_PROPAGATE;
+
+                const symbol = event.get_key_symbol();
+                if (symbol === Clutter.KEY_Left || symbol === Clutter.KEY_Right ||
+                    symbol === Clutter.KEY_Up || symbol === Clutter.KEY_Down) {
+                    this._navigateApps(symbol);
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            // Create scrollable app grid
+            this._appGridScrollView = new St.ScrollView({
+                style_class: 'mm-app-grid-scroll',
+                x_expand: true,
+                y_expand: true,
+                overlay_scrollbars: true,
+                hscrollbar_policy: St.PolicyType.NEVER,
+                vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            });
+
+            this._appGridContainer = new St.BoxLayout({
+                vertical: true,
+                x_expand: true,
+                style: 'spacing: 10px;',
+                x_align: Clutter.ActorAlign.CENTER,
+            });
+            this._appGridScrollView.set_child(this._appGridContainer);
+
+            // Create app grid with horizontal flow layout (3 columns x 2 rows = 6 apps max)
+            this._appGrid = new St.Widget({
+                layout_manager: new Clutter.FlowLayout({
+                    orientation: Clutter.Orientation.HORIZONTAL,
+                    homogeneous: true,
+                    column_spacing: 20,
+                    row_spacing: 20,
+                }),
+                x_expand: true,
+                y_expand: false,
+                visible: true,
+                style: 'padding: 20px;',
+            });
+            this._appGridContainer.add_child(this._appGrid);
+
+            // Ensure scroll view is hidden by default
+            this._appGridScrollView.visible = false;
+
+            this._appDisplay = null;
+            this._appDisplay = new AppDisplay.AppDisplay();
+            this._appDisplay.visible = false;
+            this._appDisplay.x_expand = true;
+            this._appDisplay.y_expand = true;
+            this._configureNativeAppDisplayLayout();
+
+            // Populate app grid with installed applications
+            this._populateAppGrid();
+
+            this._searchController = new St.Widget({ visible: false, x_expand: true, y_expand: true, clip_to_allocation: true });
+
+            this._contentArea = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                x_expand: true,
+                y_expand: true
+            });
+            this._contentArea.add_child(this._searchController);
+            this._contentArea.add_child(this._appGridScrollView);
+            if (this._appDisplay)
+                this._contentArea.add_child(this._appDisplay);
+
+
+            // 'page-changed' and 'page-empty' signals exist in GNOME < 46
+            if (Main.overview.searchController?.connectObject) {
+                // connectObject(..., this) auto-disconnects on destroy, even when
+                // this manager is torn down from C on a monitor change.
+                const controller = Main.overview.searchController;
+                if (GObject.signal_lookup('page-changed', controller.constructor.$gtype))
+                    controller.connectObject('page-changed', this._setVisibility.bind(this), this);
+                if (GObject.signal_lookup('page-empty', controller.constructor.$gtype))
+                    controller.connectObject('page-empty', this._onPageEmpty.bind(this), this);
+            }
+            this._connectOverviewStateWatcher();
+
+            this._group = new St.BoxLayout({
+                name: 'mm-overview-group-' + index,
+                x_expand: true, y_expand: true,
+                vertical: true,
+                style: `padding: ${OVERVIEW_GROUP_PADDING}px;` // Add some padding so it doesn't touch edges
+            });
+            this.add_child(this._group);
+
+            // Add search entry
+            this._group.add_child(this._searchEntry);
+
+            // Add content area (Grid/Thumbnails)
+            this._group.add_child(this._contentArea);
+            //this._group.add_actor(this._thumbnailsSlider);
+
+            this._monitorsChanged();
+            //this._thumbnailsSlider.slideOut();
+            this._thumbnailsBox._updatePorthole();
+
+            this.connect('notify::allocation', this._updateSpacerVisibility.bind(this));
+            //this._thumbnailsSelectSideId = this._settings.connect('changed::'+THUMBNAILS_SLIDER_POSITION_ID,
+            //                                                this._thumbnailsSelectSide.bind(this));
+            Main.layoutManager.connectObject('monitors-changed', this._monitorsChanged.bind(this), this);
+            Shell.AppSystem.get_default().connectObject(
+                'installed-changed', this._onInstalledAppsChanged.bind(this), this);
+        }
+
+        _getSearchTextFromActor(actor) {
+            if (!actor)
+                return '';
+
+            if (actor.get_text)
+                return actor.get_text() ?? '';
+            return actor.text ?? '';
+        }
+
+        _getSearchText(searchText = null) {
+            if (searchText !== null && searchText !== undefined)
+                return searchText;
+
+            if (this._destroying || !this._searchEntry)
+                return '';
+
+            return this._searchEntry.get_text() ?? '';
+        }
+
+        _setSearchText(text) {
+            if (this._destroying || !this._searchEntry)
+                return;
+
+            this._searchEntry.set_text(text);
+        }
+
+        _focusSearchEntry() {
+            if (this._destroying || !this._searchEntry)
+                return;
+
+            this._searchEntry.grab_key_focus();
+        }
+
+        _setActorVisible(actor, visible) {
+            if (this._destroying || !actor)
+                return false;
+
+            actor.visible = visible;
+            return true;
+        }
+
+        _isActorUsable(actor) {
+            if (!actor)
+                return false;
+
+            // Owned actors are released in cleanup; borrowed views on destroy.
+            return true;
+        }
+
+        _onInstalledAppsChanged() {
+            if (this._destroying)
+                return;
+
+            this._populateAppGrid();
+            // Reapply the current query, including keyboard focus, while open.
+            return this._syncAppGridState();
+        }
+
+        _populateAppGrid() {
+            // Get all installed applications
+            const appSystem = Shell.AppSystem.get_default();
+            const apps = appSystem.get_installed().filter(app => {
+                return app.should_show();
+            });
+
+            console.debug('[MultiMonitors] Found ' + apps.length + ' apps to display');
+
+            // Sort alphabetically
+            apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
+
+            // Release focus before retiring buttons, including removed apps.
+            this._setFocusedApp(null);
+            for (const child of this._appGrid.get_children())
+                child.destroy();
+
+            // Search must cover all apps; only the displayed results are capped.
+            for (const app of apps) {
+                const appButton = this._createAppButton(app);
+                this._appGrid.add_child(appButton);
+            }
+
+            console.debug('[MultiMonitors] App grid populated with ' + apps.length + ' buttons');
+        }
+
+        _connectOverviewStateWatcher() {
+            if (this._destroying)
+                return;
+
+            let adjustment = null;
+            const controls = Main.overview?._overview?._controls ?? Main.overview?._controls;
+            adjustment = controls?._stateAdjustment;
+
+            if (!adjustment || adjustment === this._overviewStateAdjustment)
+                return;
+
+            this._overviewStateAdjustment?.disconnectObject(this);
+
+            this._overviewStateAdjustment = adjustment;
+            // connectObject(..., this) auto-disconnects on destroy.
+            adjustment.connectObject('notify::value',
+                () => this._syncAppGridState(), this);
+        }
+
+        _isAppGridState() {
+            this._connectOverviewStateWatcher();
+
+            if (!this._overviewStateAdjustment)
+                return false;
+
+            const appGridState = OverviewControls.ControlsState?.APP_GRID ?? 2;
+            let value = 0;
+            value = this._overviewStateAdjustment.value;
+
+            return value >= appGridState - 0.5;
+        }
+
+        _createAppButton(app) {
+            const button = new St.Button({
+                style_class: 'app-well-app',
+                reactive: true,
+                button_mask: St.ButtonMask.ONE,
+                can_focus: true,
+                x_expand: false,
+                y_expand: false,
+                style: 'padding: 16px; margin: 8px; border-radius: 16px; min-width: 100px;',
+            });
+
+            // Store app reference for filtering
+            button._appInfo = app;
+
+            const box = new St.BoxLayout({
+                vertical: true, // Vertical layout for grid icon style
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                style: 'spacing: 8px;',
+            });
+            button.set_child(box);
+
+            // App icon - use the app's GIcon for proper icon display
+            let icon = null;
+            const gIcon = app.get_icon();
+            if (gIcon) {
+                icon = new St.Icon({
+                    gicon: gIcon,
+                    icon_size: 86,
+                    style_class: 'app-icon',
+                });
+            }
+
+            // Shell.App.create_icon_texture() is unavailable on GNOME 46+.
+            if (!icon && typeof app.create_icon_texture === 'function') {
+                try {
+                    icon = app.create_icon_texture(86);
+                } catch (e) {
+                    console.debug('[MultiMonitors] Could not create app icon texture: ' + e);
+                }
+            }
+
+            // Final fallback to generic icon
+            if (!icon) {
+                icon = new St.Icon({
+                    icon_name: 'application-x-executable',
+                    icon_size: 86,
+                });
+            }
+
+            box.add_child(icon);
+
+            // App name - centered below icon
+            const label = new St.Label({
+                text: app.get_name(),
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'font-size: 16px; font-weight: bold; color: white; max-width: 140px;',
+            });
+            label.clutter_text.set_ellipsize(3); // PANGO_ELLIPSIZE_END
+            label.clutter_text.set_line_wrap(false);
+            box.add_child(label);
+
+            // Click handler to launch app
+            button.connect('clicked', () => {
+                this._launchApp(app);
+            });
+
+            // Hover handler to set focus on this app
+            button.connect('notify::hover', () => {
+                if (button.hover) {
+                    this._setFocusedApp(button);
+                }
+            });
+
+            return button;
+        }
+
+        _setFocusedApp(app) {
+            if (this._destroying)
+                return;
+
+            // Base style without highlight (use consistent sizing)
+            const baseStyle = 'padding: 16px; margin: 8px; border-radius: 16px; min-width: 120px;';
+            // Focused style uses box-shadow with white/gray color at 75% opacity
+            const focusedStyle = baseStyle + ' box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.24); background-color: rgba(255, 255, 255, 0.39);';
+
+            // Remove highlight from previous focused app
+            if (this._focusedApp && this._focusedApp !== app) {
+                this._focusedApp.remove_style_pseudo_class('focus');
+                this._focusedApp.set_style(baseStyle);
+            }
+
+            // Set new focused app
+            this._focusedApp = app;
+
+            // Add highlight to focused app
+            if (this._focusedApp) {
+                this._focusedApp.add_style_pseudo_class('focus');
+                this._focusedApp.set_style(focusedStyle);
+            }
+        }
+
+        _navigateApps(keySymbol) {
+            if (this._destroying || !this._appGrid) return;
+
+            // Get visible apps
+            let children = [];
+            children = this._appGrid.get_children();
+
+            const visibleApps = children.filter(child => {
+                return child.visible && child._appInfo;
+            });
+
+            if (visibleApps.length === 0) return;
+
+            // Find current focused index
+            let currentIndex = -1;
+            if (this._focusedApp) {
+                currentIndex = visibleApps.indexOf(this._focusedApp);
+            }
+
+            // Calculate new index based on key
+            let newIndex = currentIndex;
+            if (keySymbol === Clutter.KEY_Right || keySymbol === Clutter.KEY_Down) {
+                newIndex = (currentIndex + 1) % visibleApps.length;
+            } else if (keySymbol === Clutter.KEY_Left || keySymbol === Clutter.KEY_Up) {
+                newIndex = currentIndex - 1;
+                if (newIndex < 0) newIndex = visibleApps.length - 1;
+            }
+
+            // Set focus to new app
+            this._setFocusedApp(visibleApps[newIndex]);
+        }
+
+        _launchApp(appInfo) {
+            const targetMonitor = this._monitorIndex;
+            const shellApp = Shell.AppSystem.get_default().lookup_app(appInfo.get_id());
+
+            if (shellApp) {
+                this._launchSignalIds ??= new Set();
+                const windowCreatedId = global.display.connect('window-created', (_display, window) => {
+                    const windowApp = Shell.WindowTracker.get_default().get_window_app(window);
+                    if (windowApp?.get_id() !== shellApp.get_id())
+                        return;
+
+                    global.display.disconnect(windowCreatedId);
+                    this._launchSignalIds.delete(windowCreatedId);
+                    this._scheduleWindowOperation(window, 100,
+                        () => this._moveWindowToMonitor(window, targetMonitor));
+                });
+                this._launchSignalIds.add(windowCreatedId);
+
+                const disconnectTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 5000, () => {
+                    this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== disconnectTimeoutId);
+                    if (this._launchSignalIds.delete(windowCreatedId))
+                        global.display.disconnect(windowCreatedId);
+                    return GLib.SOURCE_REMOVE;
+                });
+                this._pendingTimeouts.push(disconnectTimeoutId);
+                shellApp.open_new_window(-1);
+            } else {
+                // Gio.AppInfo.launch can fail when the executable is unavailable.
+                try {
+                    appInfo.launch([], null);
+                } catch (e) {
+                    console.warn('[MultiMonitors] Failed to launch app: ' + e.message);
+                }
+            }
+
+            Main.overview.hide();
+        }
+
+        _scheduleWindowOperation(window, delay, callback) {
+            this._windowOperations ??= new Set();
+            const operation = { window, timeoutId: 0, unmanagedId: 0 };
+            const release = () => {
+                if (operation.timeoutId)
+                    GLib.source_remove(operation.timeoutId);
+                operation.timeoutId = 0;
+                window.disconnect(operation.unmanagedId);
+                this._windowOperations.delete(operation);
+            };
+            operation.unmanagedId = window.connect('unmanaged', release);
+            operation.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                operation.timeoutId = 0;
+                release();
+                callback();
+                return GLib.SOURCE_REMOVE;
+            });
+            this._windowOperations.add(operation);
+        }
+
+        _moveWindowToMonitor(window, targetMonitor) {
+            if (!Main.layoutManager.monitors[targetMonitor])
+                return;
+
+            window.move_to_monitor(targetMonitor);
+            this._scheduleWindowOperation(window, 50, () => {
+                const monitor = Main.layoutManager.monitors[targetMonitor];
+                if (!monitor)
+                    return;
+                const rect = window.get_frame_rect();
+                const newX = monitor.x + Math.floor((monitor.width - rect.width) / 2);
+                const newY = monitor.y + Math.floor((monitor.height - rect.height) / 2);
+                window.move_frame(true, newX, newY);
+            });
+        }
+
+        _filterAppGrid(searchText) {
+            this._syncAppGridState(searchText);
+        }
+
+        _refreshNativeAppDisplay() {
+            if (!this._appDisplay)
+                return;
+
+            this._configureNativeAppDisplayLayout();
+            this._syncNativePageIndicatorsPosition();
+            if (this._appDisplay._redisplayWorkId)
+                Main.queueDeferredWork(this._appDisplay._redisplayWorkId);
+            else if (this._appDisplay._redisplay)
+                this._appDisplay._redisplay();
+        }
+
+        _configureNativeAppDisplayLayout() {
+            let layoutManager = null;
+            if (!this._isActorUsable(this._appDisplay)) {
+                this._appDisplay = null;
+                this._appDisplayVisible = false;
+                return;
+            }
+
+            this._syncNativeAppDisplayMargins();
+
+            layoutManager = this._appDisplay?._grid?.layoutManager;
+            if (!layoutManager)
+                return;
+
+            const portrait = this._isPortraitMonitor();
+            const columns = portrait ? 4 : 8;
+            const rows = portrait ? 5 : 3;
+            const layoutKey = `${columns}x${rows}`;
+
+            if (this._lastAppDisplayLayout === layoutKey &&
+                layoutManager.columnsPerPage === columns &&
+                layoutManager.rowsPerPage === rows)
+                return;
+
+            layoutManager.columnsPerPage = columns;
+            layoutManager.rowsPerPage = rows;
+            this._lastAppDisplayLayout = layoutKey;
+
+            this._appDisplay._grid.queue_relayout();
+        }
+
+        _syncNativePageIndicatorsPosition() {
+            if (!this._isActorUsable(this._appDisplay)) {
+                this._appDisplay = null;
+                this._appDisplayVisible = false;
+                return;
+            }
+
+            const indicators = this._appDisplay?._pageIndicators;
+            const monitor = Main.layoutManager.monitors[this._monitorIndex];
+            if (!indicators || !monitor)
+                return;
+            if (!this._isActorUsable(indicators)) {
+                this._appDisplay = null;
+                this._appDisplayVisible = false;
+                return;
+            }
+
+            const portrait = this._isPortraitMonitor();
+            // Nothing to clear when the app grid already ends above the dock
+            // (see _syncNativeAppDisplayMargins).
+            let lift = 0;
+            if (!(this._getAppGridMetrics()?.dashHeight > 0)) {
+                lift = portrait
+                    ? Math.max(180, Math.min(Math.round(monitor.height * 0.14), 320))
+                    : Math.max(90, Math.min(Math.round(monitor.height * 0.09), 160));
+            }
+
+            indicators.translation_y = -lift;
+            indicators.visible = true;
+            indicators.opacity = 255;
+        }
+
+        // Heights of the app-grid page, with the arithmetic that
+        // ControlsManagerLayout (overviewControls.js) uses on the primary
+        // monitor: below the search entry a strip for the workspace previews,
+        // below the strip the app grid, and the dash's height left free at
+        // the bottom.
+        _getAppGridMetrics() {
+            let height = this.height;
+            if (!(height > 0))
+                height = Main.layoutManager.getWorkAreaForMonitor(this._monitorIndex)?.height ?? 0;
+            if (!(height > 0))
+                return null;
+
+            return {
+                spacing: Math.round(height * VERTICAL_SPACING_RATIO),
+                stripHeight: Math.round(height * (OverviewControls.SMALL_WORKSPACE_RATIO ?? 0.15)),
+                dashHeight: Math.round(Main.overview.dash?.height ?? 0),
+            };
+        }
+
+        // Start the app grid below the workspace previews and end it above
+        // the dock, like the primary monitor's.
+        _syncNativeAppDisplayMargins() {
+            const metrics = this._getAppGridMetrics();
+            if (!metrics || !this._appDisplay)
+                return;
+
+            const top = 2 * metrics.spacing + metrics.stripHeight;
+            const bottom = Math.max(0,
+                metrics.dashHeight + metrics.spacing - OVERVIEW_GROUP_PADDING);
+
+            // As a style: St sets an actor's margins again from its style
+            // whenever the style is computed anew.
+            const style = `margin-top: ${top}px; margin-bottom: ${bottom}px;`;
+            if (this._appDisplay.style !== style)
+                this._appDisplay.style = style;
+        }
+
+        // Where the workspace previews go in the app-grid state: `y` in the
+        // coordinates of `view`, below this monitor's search entry.
+        _getWorkspacesStrip(view) {
+            const metrics = this._getAppGridMetrics();
+            const parent = view?.get_parent();
+            if (this._destroying || !metrics || !parent ||
+                !this._contentArea?.has_allocation())
+                return null;
+
+            const [, contentY] = this._contentArea.get_transformed_position();
+            const [, parentY] = parent.get_transformed_position();
+            // Without the view's own transform.
+            const y = Math.round(contentY - parentY - view.allocation.y1) + metrics.spacing;
+            if (!Number.isFinite(y))
+                return null;
+
+            return {y, height: metrics.stripHeight};
+        }
+
+        _usesWorkspacesStrip(view) {
+            return !!view && Object.hasOwn(view, '_getWorkspacesBoxForState');
+        }
+
+        // GNOME lays a secondary monitor's workspaces out for an overview
+        // without an app grid: at full size in the app-grid state too. Give
+        // them the strip of the primary monitor there, so that GNOME itself
+        // sizes the previews and animates between the two states.
+        _installWorkspacesStrip(view) {
+            if (typeof view?._getWorkspacesBoxForState !== 'function' ||
+                this._usesWorkspacesStrip(view))
+                return;
+
+            const manager = this;
+            const appGridState = OverviewControls.ControlsState?.APP_GRID ?? 2;
+
+            view._getWorkspacesBoxForState = function (state, ...args) {
+                const box = Object.getPrototypeOf(this)
+                    ._getWorkspacesBoxForState.call(this, state, ...args);
+                if (state !== appGridState)
+                    return box;
+
+                const strip = manager._getWorkspacesStrip(this);
+                if (!strip)
+                    return box;
+
+                manager._keepStripHeight(this._workspacesView);
+                box.set_origin(box.x1, strip.y);
+                box.set_size(box.get_width(), strip.height);
+                return box;
+            };
+            view.queue_relayout();
+        }
+
+        // Dash to Dock shortens the previews of a secondary monitor by its
+        // dock's height, to keep them clear of the dock. The strip is far from
+        // the dock: give the previews its whole height, as GNOME does.
+        _keepStripHeight(view) {
+            if (typeof view?._getFirstFitAllWorkspaceBox !== 'function' ||
+                Object.hasOwn(view, '_getFirstFitAllWorkspaceBox'))
+                return;
+
+            view._getFirstFitAllWorkspaceBox = function (box, spacing, vertical) {
+                const fitAllBox = Object.getPrototypeOf(this)
+                    ._getFirstFitAllWorkspaceBox.call(this, box, spacing, vertical);
+                if (!vertical) {
+                    fitAllBox.y1 = box.y1;
+                    fitAllBox.y2 = box.y2;
+                }
+                return fitAllBox;
+            };
+        }
+
+        _removeWorkspacesStrip(view) {
+            if (!view)
+                return;
+
+            if (Object.hasOwn(view, '_getWorkspacesBoxForState'))
+                delete view._getWorkspacesBoxForState;
+
+            const workspacesView = view._workspacesView;
+            if (workspacesView && Object.hasOwn(workspacesView, '_getFirstFitAllWorkspaceBox'))
+                delete workspacesView._getFirstFitAllWorkspaceBox;
+        }
+
+        _isPortraitMonitor() {
+            const monitor = Main.layoutManager.monitors[this._monitorIndex];
+            return !!monitor && monitor.height > monitor.width;
+        }
+
+        _getAppGridWorkspacePreviewGeometry() {
+            const monitor = Main.layoutManager.monitors[this._monitorIndex];
+            if (!monitor)
+                return null;
+
+            const portrait = this._isPortraitMonitor();
+            const width = portrait
+                ? Math.max(240, Math.min(Math.round(monitor.width * 0.25), 320))
+                : Math.max(560, Math.min(Math.round(monitor.width * 0.34), 700));
+            const height = Math.round(width * 0.28);
+            const yOffset = portrait
+                ? Math.max(24, Math.round(monitor.height * 0.018))
+                : Math.max(88, Math.round(monitor.height * 0.075));
+
+            return {
+                x: monitor.x + Math.round((monitor.width - width) / 2),
+                y: monitor.y + yOffset,
+                width,
+                height,
+            };
+        }
+
+        _getFullWorkspaceGeometry() {
+            const workArea = Main.layoutManager.getWorkAreaForMonitor(this._monitorIndex);
+            if (!workArea)
+                return null;
+
+            return {
+                x: workArea.x,
+                y: workArea.y,
+                width: workArea.width,
+                height: workArea.height,
+            };
+        }
+
+        _syncWorkspacesViewGeometry(compact) {
+            if (!this._workspacesViews)
+                return;
+
+            if (!this._isActorUsable(this._workspacesViews)) {
+                this._workspacesViews = null;
+                this._lastWorkspaceTransformKey = null;
+                return;
+            }
+
+            // A view with the strip places the previews itself.
+            if (this._usesWorkspacesStrip(this._workspacesViews)) {
+                const strip = compact ? this._getWorkspacesStrip(this._workspacesViews) : null;
+                const stripKey = strip ? `strip:${strip.y}:${strip.height}` : 'strip';
+                if (this._lastWorkspaceTransformKey !== stripKey) {
+                    this._resetWorkspacesViewTransform();
+                    this._workspacesViews.queue_relayout();
+                    this._lastWorkspaceTransformKey = stripKey;
+                }
+                return;
+            }
+
+            const fullGeometry = this._getFullWorkspaceGeometry();
+            if (!fullGeometry)
+                return;
+
+            this._workspacesViews.set_pivot_point(0, 0);
+
+            if (!compact) {
+                if (this._lastWorkspaceTransformKey === 'full')
+                    return;
+
+                this._resetWorkspacesViewTransform();
+                this._lastWorkspaceTransformKey = 'full';
+                return;
+            }
+
+            const compactGeometry = this._getAppGridWorkspacePreviewGeometry();
+            if (!compactGeometry)
+                return;
+
+            const scale = compactGeometry.width / fullGeometry.width;
+            const transformKey = [
+                Math.round(compactGeometry.x),
+                Math.round(compactGeometry.y),
+                Math.round(scale * 1000),
+            ].join(':');
+            if (this._lastWorkspaceTransformKey === transformKey)
+                return;
+
+            this._workspacesViews.translation_x = compactGeometry.x - fullGeometry.x;
+            this._workspacesViews.translation_y = compactGeometry.y - fullGeometry.y;
+            this._workspacesViews.scale_x = scale;
+            this._workspacesViews.scale_y = scale;
+            this._lastWorkspaceTransformKey = transformKey;
+        }
+
+        _resetWorkspacesViewTransform() {
+            if (!this._workspacesViews)
+                return;
+
+            if (!this._isActorUsable(this._workspacesViews)) {
+                this._workspacesViews = null;
+                this._lastWorkspaceTransformKey = null;
+                return;
+            }
+
+            this._workspacesViews.translation_x = 0;
+            this._workspacesViews.translation_y = 0;
+            this._workspacesViews.scale_x = 1;
+            this._workspacesViews.scale_y = 1;
+        }
+
+        async _syncAppGridState(searchText = null) {
+            if (this._destroying)
+                return;
+
+            const requestId = this._appSearchRequestId = (this._appSearchRequestId ?? 0) + 1;
+            const normalizedSearch = this._getSearchText(searchText).toLowerCase().trim();
+            const hasText = this._visible && normalizedSearch.length > 0;
+            const showApps = this._visible && this._isAppGridState();
+            if (this._destroying)
+                return;
+            const useNativeAppDisplay = !!this._appDisplay;
+
+            if (!this._appGrid) return;
+
+            if (!hasText && !showApps) {
+                this._setFocusedApp(null);
+
+                if (this._appGridScrollView) {
+                    this._setActorVisible(this._appGridScrollView, false);
+                    if (this._destroying)
+                        return;
+                }
+
+                if (this._appDisplayVisible && this._appDisplay) {
+                    this._setActorVisible(this._appDisplay, false);
+                    if (this._destroying)
+                        return;
+                }
+                this._appDisplayVisible = false;
+
+                // Search hides the borrowed workspace actor as well as changing
+                // its geometry. Restore both when returning to the window picker.
+                if (this._visible) {
+                    this._tryFindWorkspacesViews();
+                    if (this._destroying)
+                        return;
+                }
+                this._resetWorkspacesViewTransform();
+                this._lastWorkspaceTransformKey = null;
+                if (this._visible && this._workspacesViews) {
+                    this._workspacesViews.visible = true;
+                    this._workspacesViews.opacity = 255;
+                }
+
+                if (this._thumbnailsBox) {
+                    this._setActorVisible(this._thumbnailsBox, true);
+                    if (this._destroying)
+                        return;
+                }
+
+                if (this._searchController)
+                    this._setActorVisible(this._searchController, false);
+
+                return;
+            }
+
+            let children = [];
+            children = this._appGrid.get_children();
+
+            const maxVisibleApps = 6; // Maximum apps to show when searching
+            let matchingIds = [];
+            if (hasText) {
+                // Use the primary overview's provider for desktop-file keywords,
+                // multi-word matching, parental controls, and usage ranking.
+                this._setFocusedApp(null);
+                for (const child of children)
+                    child.visible = false;
+                this._appSearchProvider ??= new AppDisplay.AppSearchProvider();
+                // The asynchronous search provider can reject a request.
+                try {
+                    matchingIds = await this._appSearchProvider.getInitialResultSet(
+                        normalizedSearch.split(/\s+/), null);
+                } catch (e) {
+                    console.debug('[MultiMonitors] App search failed: ' + e);
+                }
+                // Typing, closing, installing apps, or teardown can supersede a search.
+                if (this._destroying || requestId !== this._appSearchRequestId)
+                    return;
+
+                const buttons = new Map(children.filter(child => child._appInfo)
+                    .map(child => [child._appInfo.get_id(), child]));
+                matchingIds = matchingIds.filter(id => buttons.has(id)).slice(0, maxVisibleApps);
+                matchingIds.forEach((id, index) =>
+                    this._appGrid.set_child_at_index(buttons.get(id), index));
+                children = this._appGrid.get_children();
+            } else if (showApps && !useNativeAppDisplay) {
+                // Restore alphabetical order for the fallback app grid.
+                children.sort((a, b) =>
+                    (a._appInfo?.get_name() ?? '').localeCompare(b._appInfo?.get_name() ?? ''));
+                children.forEach((child, index) => this._appGrid.set_child_at_index(child, index));
+            }
+            let visibleCount = 0;
+            let firstVisibleApp = null;
+
+            for (const child of children) {
+                if (!child._appInfo) {
+                    child.visible = showApps && !hasText && !useNativeAppDisplay;
+                    continue;
+                }
+
+                if (!hasText) {
+                    child.visible = showApps && !useNativeAppDisplay;
+                } else {
+                    // Show only first 6 matching apps horizontally
+                    const matches = matchingIds.includes(child._appInfo.get_id());
+                    if (matches && visibleCount < maxVisibleApps) {
+                        child.visible = true;
+                        if (!firstVisibleApp) {
+                            firstVisibleApp = child;
+                        }
+                        visibleCount++;
+                    } else {
+                        child.visible = false;
+                    }
+                }
+            }
+
+            // Set focus on first visible app using the shared method
+            this._setFocusedApp(hasText ? firstVisibleApp : null);
+
+            // Toggle visibility of the entire scroll view based on search text
+            if (this._appGridScrollView) {
+                console.debug('[MultiMonitors] _filterAppGrid: hasText=' + hasText + ', visibleApps=' + visibleCount);
+
+                // Always re-discover workspacesViews to ensure we have a valid reference
+                this._tryFindWorkspacesViews();
+                if (this._destroying)
+                    return;
+
+                this._setActorVisible(this._appGridScrollView, hasText || (showApps && !useNativeAppDisplay));
+                if (this._destroying)
+                    return;
+
+                if (this._appDisplay) {
+                    const nextAppDisplayVisible = showApps && !hasText;
+                    this._configureNativeAppDisplayLayout();
+                    if (this._destroying)
+                        return;
+                    if (this._appDisplay) {
+                        this._syncNativePageIndicatorsPosition();
+                        if (this._destroying)
+                            return;
+                        this._setActorVisible(this._appDisplay, nextAppDisplayVisible);
+                        if (this._destroying)
+                            return;
+                        if (nextAppDisplayVisible && !this._appDisplayVisible)
+                            this._refreshNativeAppDisplay();
+                        this._appDisplayVisible = nextAppDisplayVisible && !!this._appDisplay;
+                    } else {
+                        this._appDisplayVisible = false;
+                    }
+                }
+
+                // Keep the real workspace preview strip visible in app-grid mode,
+                // matching the primary overview. Only hide it for typed search.
+                if (this._workspacesViews) {
+                    if (!this._isActorUsable(this._workspacesViews)) {
+                        this._workspacesViews = null;
+                        this._lastWorkspaceTransformKey = null;
+                    }
+                }
+
+                if (this._workspacesViews) {
+                    this._workspacesViews.visible = !hasText;
+                    this._workspacesViews.opacity = hasText ? 0 : 255;
+                    this._syncWorkspacesViewGeometry(showApps && !hasText);
+                    console.debug('[MultiMonitors] Set workspacesViews visible=' + !hasText + ', opacity=' + (hasText ? 0 : 255));
+                }
+
+                // Also hide our own thumbnails box when searching or showing apps.
+                if (this._thumbnailsBox) {
+                    this._setActorVisible(this._thumbnailsBox, !(hasText || showApps));
+                    if (this._destroying)
+                        return;
+                }
+
+                // Hide the searchController placeholder when using our own grid.
+                if (this._searchController) {
+                    this._setActorVisible(this._searchController, false);
+                }
+            }
+        }
+
+        _tryFindWorkspacesViews() {
+            // Helper to find workspaces view if not found on initial show()
+            let workspacesDisplay = null;
+
+            if (Main.overview.searchController && Main.overview.searchController._workspacesDisplay) {
+                workspacesDisplay = Main.overview.searchController._workspacesDisplay;
+            }
+            else if (Main.overview._overview && Main.overview._overview._controls && Main.overview._overview._controls._workspacesDisplay) {
+                workspacesDisplay = Main.overview._overview._controls._workspacesDisplay;
+            }
+            else if (Main.overview._controls && Main.overview._controls._workspacesDisplay) {
+                workspacesDisplay = Main.overview._controls._workspacesDisplay;
+            }
+
+            if (workspacesDisplay && workspacesDisplay._workspacesViews && workspacesDisplay._workspacesViews[this._monitorIndex]) {
+                this._setWorkspacesViews(workspacesDisplay._workspacesViews[this._monitorIndex]);
+                console.debug('[MultiMonitors] Lazy discovery: Found workspacesView for monitor ' + this._monitorIndex);
+            } else if (workspacesDisplay && workspacesDisplay._primaryWorkspacesView && this._monitorIndex === Main.layoutManager.primaryIndex) {
+                this._setWorkspacesViews(workspacesDisplay._primaryWorkspacesView);
+                console.debug('[MultiMonitors] Lazy discovery: Found primary workspacesView');
+            }
+        }
+
+        _setWorkspacesViews(view) {
+            // `view` is a borrowed reference to GNOME Shell's own workspacesView
+            // (SecondaryMonitorDisplay / WorkspacesView). Shell destroys and
+            // recreates these on monitor and overview-state changes, so a cached
+            // reference goes stale. Probing it later with a property read (see
+            // _isActorUsable) or writing a transform touches a disposed GObject,
+            // which spams the journal with "already disposed" and can throw.
+            //
+            // Instead, track its `destroy` signal and drop our reference the
+            // moment Shell tears it down (before finalization) so we never
+            // touch a disposed object. connectObject(..., this) also auto-cleans
+            // when this manager itself is destroyed.
+            if (view === this._workspacesViews)
+                return;
+
+            this._workspacesViews?.disconnectObject(this);
+            this._removeWorkspacesStrip(this._workspacesViews);
+
+            this._workspacesViews = view;
+            this._lastWorkspaceTransformKey = null;
+
+            if (!view)
+                return;
+
+            this._installWorkspacesStrip(view);
+
+            view.connectObject('destroy', () => {
+                this._workspacesViews = null;
+                this._lastWorkspaceTransformKey = null;
+            }, this);
+        }
+
+        show() {
+            if (this._destroying)
+                return;
+
+            // Called when overview is shown
+            this._visible = true;
+            this._connectOverviewStateWatcher();
+            this._syncAppGridState();
+
+            // Check if cursor is on this monitor and focus search entry
+            const [x, y] = global.get_pointer();
+            const monitor = Main.layoutManager.monitors[this._monitorIndex];
+
+            if (monitor) {
+                const isOnThisMonitor = (
+                    x >= monitor.x &&
+                    x < monitor.x + monitor.width &&
+                    y >= monitor.y &&
+                    y < monitor.y + monitor.height
+                );
+
+                if (isOnThisMonitor && this._searchEntry) {
+                    // Use a small delay to ensure the overview is fully shown
+                    const focusTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                        this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== focusTimeoutId);
+                        this._focusSearchEntry();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._pendingTimeouts.push(focusTimeoutId);
+                }
+            }
+        }
+
+        hide() {
+            if (this._destroying)
+                return;
+
+            // Called when overview is closed - clear the search input
+            this._visible = false;
+            this._setSearchText('');
+            // Reset app grid visibility
+            if (this._appGridScrollView)
+                this._setActorVisible(this._appGridScrollView, false);
+            if (this._appDisplay)
+                this._setActorVisible(this._appDisplay, false);
+            this._appDisplayVisible = false;
+            this._resetWorkspacesViewTransform();
+            this._lastWorkspaceTransformKey = null;
+            this._syncAppGridState('');
+            // Clear the first visible app reference
+            this._firstVisibleApp = null;
+        }
+
+        _disconnectAll() {
+            this._destroying = true;
+
+            // Remove all pending timeouts per EGO guidelines
+            for (let timeoutId of this._pendingTimeouts) {
+                if (timeoutId) {
+                    GLib.source_remove(timeoutId);
+                }
+            }
+            this._pendingTimeouts = [];
+            for (const id of this._launchSignalIds ?? [])
+                global.display.disconnect(id);
+            this._launchSignalIds = null;
+            for (const operation of this._windowOperations ?? []) {
+                GLib.source_remove(operation.timeoutId);
+                operation.window.disconnect(operation.unmanagedId);
+            }
+            this._windowOperations = null;
+
+            // All handlers were connected with connectObject(..., this), so a
+            // single disconnectObject(this) per source removes them.
+            Main.overview.searchController?.disconnectObject(this);
+            Main.layoutManager.disconnectObject(this);
+            Shell.AppSystem.get_default().disconnectObject(this);
+            this._overviewStateAdjustment?.disconnectObject(this);
+            this._overviewStateAdjustment = null;
+            this._resetWorkspacesViewTransform();
+            this._removeWorkspacesStrip(this._workspacesViews);
+            // Drop the borrowed workspacesView's `destroy` handler. connectObject
+            // auto-cleans when this actor is finalized, but this covers the paths
+            // where _disconnectAll runs without our own destruction.
+            this._workspacesViews?.disconnectObject(this);
+            this._workspacesViews = null;
+            this._lastWorkspaceTransformKey = null;
+            this._focusedApp = null;
+            this._appSearchProvider = null;
+            this._searchEntry = null;
+        }
+
+        _monitorsChanged() {
+            this._primaryMonitorOnTheLeft = Main.layoutManager.monitors[this._monitorIndex].x > Main.layoutManager.primaryMonitor.x;
+            this._thumbnailsSelectSide();
+        }
+
+        _thumbnailsSelectSide() {
+            // Thumbnails slider functionality is disabled/commented in this version
+            // This stub prevents crashes when the method is called
+            // Original implementation would position thumbnails on left or right side
+            return;
+        }
+
+        /*
+        // Original thumbnailsSelectSide implementation (disabled)
+        _thumbnailsSelectSide() {
+            let thumbnailsSlider;
+            thumbnailsSlider = this._thumbnailsSlider;
+         
+            let sett = this._settings.get_string(THUMBNAILS_SLIDER_POSITION_ID);
+            let onLeftSide = sett === 'left' || (sett === 'auto' && this._primaryMonitorOnTheLeft);
+         
+            if (onLeftSide) {
+                let first = this._group.get_first_child();
+                if (first != thumbnailsSlider) {
+                    this._thumbnailsSlider.layout.slideDirection = OverviewControls.SlideDirection.LEFT;
+                    this._thumbnailsBox.remove_style_class_name('workspace-thumbnails');
+                    this._thumbnailsBox.set_style_class_name('workspace-thumbnails workspace-thumbnails-left');
+                    this._group.set_child_below_sibling(thumbnailsSlider, first)
+                }
+            }
+            else {
+                let last = this._group.get_last_child();
+                if (last != thumbnailsSlider) {
+                    this._thumbnailsSlider.layout.slideDirection = OverviewControls.SlideDirection.RIGHT;
+                    this._thumbnailsBox.remove_style_class_name('workspace-thumbnails workspace-thumbnails-left');
+                    this._thumbnailsBox.set_style_class_name('workspace-thumbnails');
+                    this._group.set_child_above_sibling(thumbnailsSlider, last);
+                }
+            }
+            this._fixGeometry = 3;
+        }
+        */
+
+        _updateSpacerVisibility() {
+            if (Main.layoutManager.monitors.length < this._monitorIndex)
+                return;
+
+            let top_spacer_height = Main.layoutManager.primaryMonitor.height;
+
+            let panelGhost_height = 0;
+            const mmOverviewRef = ('mmOverview' in Main) ? Main.mmOverview : MultiMonitors.mmOverview;
+            const mmOverviewActor = mmOverviewRef?.[this._monitorIndex]?._overview;
+            if (mmOverviewActor?._panelGhost)
+                panelGhost_height = mmOverviewActor._panelGhost.get_height();
+
+            const allocation = Main.overview?._overview?._controls?.allocation;
+            if (!allocation)
+                return;
+            let primaryControl_height = allocation.get_height();
+            let bottom_spacer_height = Main.layoutManager.primaryMonitor.height - allocation.y2;
+
+            top_spacer_height -= primaryControl_height + panelGhost_height + bottom_spacer_height;
+            top_spacer_height = Math.round(top_spacer_height);
+
+            let spacer = mmOverviewActor?._spacer ?? null;
+            if (!spacer) return;
+            if (spacer.get_height() != top_spacer_height) {
+                this._spacer_height = top_spacer_height;
+                spacer.set_height(top_spacer_height);
+            }
+        }
+
+        getWorkspacesActualGeometry() {
+            return this._getFullWorkspaceGeometry() ?? { x: 0, y: 0, width: 0, height: 0 };
+        }
+
+        /*
+        getWorkspacesActualGeometry() {
+            // ... (Duplicate/unused)
+        }
+        */
+    });
+
+export const MultiMonitorsOverviewActor = GObject.registerClass(
+    class MultiMonitorsOverviewActor extends St.BoxLayout {
+        _init(index, settings) {
+            this._monitorIndex = index;
+            this._settings = settings;
+            super._init({
+                name: 'mm-overview-' + index,
+                /* Translators: This is the main view to select
+                    activities. See also note for "Activities" string. */
+                accessible_name: _("MMOverview@" + index),
+                vertical: true,
+            });
+
+            this.add_constraint(new LayoutManager.MonitorConstraint({ index: this._monitorIndex }));
+
+            this._panelGhost = null;
+            // Use helper function to get mmPanel array
+            const mmPanelRef = Constants.getMMPanelArray();
+            if (mmPanelRef) {
+                for (let idx in mmPanelRef) {
+                    if (mmPanelRef[idx].monitorIndex !== this._monitorIndex)
+                        continue
+                    // Add a clone of the panel to the overview so spacing and such is
+                    // automatic
+                    this._panelGhost = new St.Bin({
+                        child: new Clutter.Clone({ source: mmPanelRef[idx] }),
+                        reactive: false,
+                        opacity: 0,
+                    });
+                    this.add_child(this._panelGhost);
+                    break;
+                }
+            }
+
+            this._spacer = new St.Widget();
+            this.add_child(this._spacer);
+
+            this._controls = new MultiMonitorsControlsManager(this._monitorIndex, this._settings);
+
+            // Add our same-line elements after the search entry
+            this.add_child(this._controls);
+        }
+    });
+
+
+export class MultiMonitorsOverview {
+    constructor(index, settings) {
+        this.monitorIndex = index;
+        this._settings = settings;
+
+        this._initCalled = true;
+        this._overview = new MultiMonitorsOverviewActor(this.monitorIndex, this._settings);
+        this._overview._delegate = this;
+        Main.layoutManager.overviewGroup.add_child(this._overview);
+
+        // Own these handlers with the overview ACTOR so GJS auto-disconnects
+        // them when the actor is destroyed (including C-side teardown on a
+        // monitor change), not just when our destroy() is called explicitly.
+        Main.overview.connectObject(
+            'showing', this._show.bind(this),
+            'hiding', this._hide.bind(this),
+            this._overview);
+
+        // Startup, enabling the extension, or rebuilding monitors can create
+        // this actor after `showing` was emitted. Adopt the current state so
+        // search works immediately, without closing and reopening the overview.
+        // visibleTarget excludes the closing animation, unlike visible.
+        if (Main.overview.visibleTarget)
+            this._show();
+    }
+
+    getWorkspacesActualGeometry() {
+        return this._overview._controls.getWorkspacesActualGeometry();
+    }
+
+    _show() {
+        this._overview._controls.show();
+    }
+
+    _hide() {
+        this._overview._controls.hide();
+    }
+
+    destroy() {
+        Main.overview.disconnectObject(this._overview);
+
+        Main.layoutManager.overviewGroup.remove_child(this._overview);
+        this._overview._delegate = null;
+        this._overview.destroy();
+    }
+
+    addAction(action) {
+        this._overview.add_action(action);
+    }
+
+    removeAction(action) {
+        if (action.get_actor())
+            this._overview.remove_action(action);
+    }
+}

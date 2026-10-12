@@ -1,0 +1,9 @@
+{
+    "uuid": "downloads-fan@macstyle.local",
+    "name": "Downloads Fan",
+    "description": "Click the Downloads icon in the dock to fan out the newest files of the Downloads folder, as macOS stacks do; the icon itself shows the newest download sticking out of the folder. Needs the launcher downloads-folder.desktop, which calls org.macstyle.DownloadsFan.Toggle on the session bus and opens the folder when this extension is off.",
+    "shell-version": [
+        "50"
+    ],
+    "version-name": "0.3"
+}

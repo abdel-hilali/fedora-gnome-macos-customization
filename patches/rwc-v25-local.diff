@@ -1,0 +1,24 @@
+diff --color -ru rwc-orig/rounded-window-corners@fxgn/manager/event_handlers.js rwc-patched/rounded-window-corners@fxgn/manager/event_handlers.js
+--- rwc-orig/rounded-window-corners@fxgn/manager/event_handlers.js	2026-07-20 08:10:33.000000000 +0100
++++ rwc-patched/rounded-window-corners@fxgn/manager/event_handlers.js	2026-10-12 20:07:18.536398102 +0100
+@@ -125,6 +125,10 @@
+                 source.disconnect(id);
+             }
+         });
++    } else if (roundedCornersEffect && !roundedCornersEffect.enabled) {
++        // The lamp does nothing while the overview is open, so a window it
++        // minimized can come back without it: undo what onMinimize did.
++        roundedCornersEffect.enabled = true;
+     }
+     // Chromium has a bug where windows are sometimes unminimized to the
+     // wrong location, and then move to the correct position shortly after.
+@@ -139,6 +143,9 @@
+         if (oldTimeout !== 0)
+             GLib.source_remove(oldTimeout);
+         actor.rwcCustomData.unminimizedTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
++            // Forget the id once it has run, so later cleanups do not remove a stale source.
++            if (actor.rwcCustomData)
++                actor.rwcCustomData.unminimizedTimeoutId = 0;
+             refreshRoundedCorners(actor);
+             return GLib.SOURCE_REMOVE;
+         });

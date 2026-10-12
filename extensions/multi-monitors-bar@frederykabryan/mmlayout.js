@@ -1,0 +1,696 @@
+/*
+Copyright (C) 2025-2026  Frederyk Abryan Palinoan
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, visit https://www.gnu.org/licenses/.
+*/
+
+import St from 'gi://St';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
+
+import * as MMPanel from './mmpanel.js';
+import * as MMDock from './mmdock.js';
+
+export const SHOW_PANEL_ID = 'show-panel';
+export const SHOW_DOCK_ID = 'show-dock-on-extended-monitors';
+export const ENABLE_HOT_CORNERS = 'enable-hot-corners';
+
+// Store reference to mmPanel array set by extension.js
+let _mmPanelArrayRef = null;
+
+// Helper function to set the mmPanel reference
+export function setMMPanelArrayRef(mmPanelArray) {
+	_mmPanelArrayRef = mmPanelArray;
+}
+
+// Helper function to safely access mmPanel array
+function getMMPanelArray() {
+	// First try Main.mmPanel if it exists
+	if ('mmPanel' in Main && Main.mmPanel) {
+		return Main.mmPanel;
+	}
+	// Fall back to stored reference
+	return _mmPanelArrayRef;
+}
+
+export class MultiMonitorsPanelBox {
+	constructor(monitor) {
+		this._monitor = {
+			x: monitor.x,
+			y: monitor.y,
+			width: monitor.width,
+		};
+		this._allocationChangedId = null;
+		this._geometryIdleId = 0;
+		this._geometryFightCount = 0;
+		this._geometryGiveUp = false;
+
+		this.panelBox = new St.BoxLayout({
+			name: 'panelBox',
+			vertical: true,
+			clip_to_allocation: true,
+			visible: true
+		});
+		Main.layoutManager.addChrome(this.panelBox, { affectsStruts: true, trackFullscreen: true });
+		this.panelBox.set_position(monitor.x, monitor.y);
+
+		// Capture a stable panel height that won't fluctuate during overview or
+		// fullscreen transitions on the main monitor.
+		this._stableHeight = this._getStablePanelHeight();
+		this.panelBox.set_size(monitor.width, this._stableHeight);
+		this._allocationChangedId = this.panelBox.connect('notify::allocation',
+			this._onAllocationChanged.bind(this));
+
+		Main.uiGroup.set_child_below_sibling(this.panelBox, Main.layoutManager.panelBox);
+	}
+
+	/**
+	 * Get a stable panel height that doesn't change during overview/fullscreen.
+	 * Tries multiple sources in order of reliability:
+	 * 1. Main.panel's natural preferred height (theme-defined, stable)
+	 * 2. Main.layoutManager.panelBox.height (only if > 0 and not mid-animation)
+	 * 3. Hardcoded fallback of 30px
+	 */
+	_getStablePanelHeight() {
+		// 1. Try to get the panel's natural preferred height from its theme node
+		//    This is the CSS-defined height and doesn't change during animations
+		if (Main.panel) {
+			const [, natHeight] = Main.panel.get_preferred_height(-1);
+			if (natHeight > 0)
+				return natHeight;
+		}
+
+		// 2. Try panelBox height (may be 0 during fullscreen or animations)
+		const panelBoxHeight = Main.layoutManager.panelBox.height;
+		if (panelBoxHeight > 0)
+			return panelBoxHeight;
+
+		// 3. Hardcoded fallback
+		return 30;
+	}
+
+	destroy() {
+		if (this._geometryIdleId) {
+			GLib.source_remove(this._geometryIdleId);
+			this._geometryIdleId = 0;
+		}
+
+		if (this._allocationChangedId) {
+			this.panelBox.disconnect(this._allocationChangedId);
+			this._allocationChangedId = null;
+		}
+
+		// Explicitly removeChrome before destroy so struts are cleared
+		// synchronously — prevents stale geometry on suspend/wake.
+		Main.layoutManager.removeChrome(this.panelBox);
+		this.panelBox.destroy();
+	}
+
+	updatePanel(monitor) {
+		this._monitor = {
+			x: monitor.x,
+			y: monitor.y,
+			width: monitor.width,
+		};
+		// Re-check the stable height (only updates if we get a valid new value)
+		const newHeight = this._getStablePanelHeight();
+		if (newHeight > 0)
+			this._stableHeight = newHeight;
+
+		// Caller is requesting an explicit re-apply, so unblock the fight
+		// counter and apply directly (we are not inside an allocation pass).
+		this._geometryFightCount = 0;
+		this._geometryGiveUp = false;
+		this._applyMonitorGeometry();
+	}
+
+	// notify::allocation handler. NEVER call set_size/set_position/queue_relayout
+	// directly from here — Clutter is mid-allocation and re-entering the layout
+	// machinery can produce an infinite layout pass that freezes the shell.
+	// Defer to idle so the enforcement runs outside the current pass.
+	_onAllocationChanged() {
+		if (this._geometryGiveUp || this._geometryIdleId || !this.panelBox || !this._monitor)
+			return;
+
+		if (!this._geometryNeedsUpdate())
+			return;
+
+		this._geometryIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+			this._geometryIdleId = 0;
+			this._applyMonitorGeometry();
+			return GLib.SOURCE_REMOVE;
+		});
+	}
+
+	_geometryNeedsUpdate() {
+		return (
+			Math.round(this.panelBox.x) !== this._monitor.x ||
+			Math.round(this.panelBox.y) !== this._monitor.y ||
+			Math.round(this.panelBox.width) !== this._monitor.width ||
+			Math.round(this.panelBox.height) !== this._stableHeight
+		);
+	}
+
+	_applyMonitorGeometry() {
+		if (!this.panelBox || !this._monitor)
+			return;
+
+		if (!this._geometryNeedsUpdate()) {
+			this._geometryFightCount = 0;
+			return;
+		}
+
+		// If something else keeps overriding our geometry on every pass,
+		// stop fighting — better a misaligned panel than a frozen shell.
+		// updatePanel() (monitor change, settings) will reset the counter.
+		this._geometryFightCount += 1;
+		if (this._geometryFightCount > 5) {
+			this._geometryGiveUp = true;
+			log('[MultiMonitors] Giving up geometry enforcement after repeated fights ' +
+				'(panelBox=' + Math.round(this.panelBox.width) + 'x' + Math.round(this.panelBox.height) +
+				' wanted=' + this._monitor.width + 'x' + this._stableHeight + ')');
+			return;
+		}
+
+		this.panelBox.set_position(this._monitor.x, this._monitor.y);
+		this.panelBox.set_size(this._monitor.width, this._stableHeight);
+	}
+}
+
+/**
+ * Force a synchronous layout region update so struts/work-areas are
+ * recalculated immediately rather than waiting for the next idle.
+ * This is critical to prevent the lock screen from using stale geometry.
+ */
+function _forceUpdateRegions() {
+	Main.layoutManager._updateRegions();
+}
+
+export class MultiMonitorsLayoutManager {
+	constructor(settings) {
+		this._settings = settings;
+		this._desktopSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
+
+		this._monitorIds = [];
+		this._lastPrimaryIndex = Main.layoutManager.primaryIndex;
+		this.mmPanelBox = [];
+		this.mmDock = [];
+		this.mmappMenu = false;
+
+		this._showAppMenuId = null;
+		this._monitorsChangedId = null;
+		this._workareasChangedId = null;
+		this._fullscreenChangedId = null;
+		this._geometrySyncTimeoutIds = [];
+
+		this.statusIndicatorsController = null;
+		this._layoutManager_updateHotCorners = null;
+		this._changedEnableHotCornersId = null;
+		this._blurMyShellStateChangedId = null;
+		this._workareasChangedBlurId = null;
+		this._blurReRegisterTimeoutId = null;
+		this._blurRetryTimeoutIds = [];
+
+		if (this._settings.get_boolean('enable-blur-my-shell')) {
+			this._setupBlurMyShellWatcher();
+			this._setupWorkareasBlurWatcher();
+		}
+	}
+
+	_setupBlurMyShellWatcher() {
+		if (!Main.extensionManager) return;
+
+		this._blurMyShellStateChangedId = Main.extensionManager.connect('extension-state-changed',
+			(manager, extension) => {
+				if (extension.uuid === 'blur-my-shell@aunetx' && this._settings.get_boolean('enable-blur-my-shell')) {
+					this._refreshBlurMyShellIntegration();
+				}
+			}
+		);
+	}
+
+	_refreshBlurMyShellIntegration() {
+		const mmPanelRef = getMMPanelArray();
+		if (mmPanelRef) {
+			for (const panel of mmPanelRef) {
+				if (panel) {
+					this._registerPanelWithBlurMyShell(panel);
+				}
+			}
+		}
+	}
+
+	// Re-register blur after BMS resets on workareas-changed
+	_setupWorkareasBlurWatcher() {
+		this._workareasChangedBlurId = global.display.connect('workareas-changed', () => {
+			if (!this._settings.get_boolean('enable-blur-my-shell')) return;
+
+			// Cancel any pending re-registration
+			if (this._blurReRegisterTimeoutId) {
+				GLib.source_remove(this._blurReRegisterTimeoutId);
+				this._blurReRegisterTimeoutId = null;
+			}
+
+			// BMS resets async (disable + setTimeout(enable, 1)), so wait
+			// long enough for BMS to finish its reset and re-enable
+			this._blurReRegisterTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+				this._refreshBlurMyShellIntegration();
+				this._blurReRegisterTimeoutId = null;
+				return GLib.SOURCE_REMOVE;
+			});
+		});
+	}
+
+	_registerPanelWithBlurMyShell(panel) {
+		// Primary access path: BMS exposes itself via global.blur_my_shell
+		let panelBlur = null;
+
+		if (global.blur_my_shell && global.blur_my_shell._panel_blur) {
+			panelBlur = global.blur_my_shell._panel_blur;
+		} else {
+			// Fallback: extension manager lookup
+			const extensionManager = Main.extensionManager;
+			if (!extensionManager) return;
+
+			const blurExt = extensionManager.lookup('blur-my-shell@aunetx');
+			if (!blurExt || blurExt.state !== 1) return;
+
+			// GNOME 45+: stateObj points to the extension instance
+			const blurMyShell = blurExt.stateObj || blurExt;
+			if (!blurMyShell || !blurMyShell._panel_blur) return;
+
+			panelBlur = blurMyShell._panel_blur;
+		}
+
+		if (!panelBlur) return;
+
+		// Use maybe_blur_panel which checks if already blurred
+		if (typeof panelBlur.maybe_blur_panel === 'function') {
+			panelBlur.maybe_blur_panel(panel);
+		} else if (typeof panelBlur.blur_panel === 'function') {
+			panelBlur.blur_panel(panel);
+		}
+
+		this._followBlurMyShellOverride(panelBlur, panel);
+	}
+
+	// BMS gives its background override (the 'transparent-panel' class or one
+	// of its siblings) only to the panels it knows when it starts. A panel it
+	// blurs later keeps the theme's own background on top of the blur and
+	// looks different from the main panel. Ask BMS to treat it like the main one.
+	_followBlurMyShellOverride(panelBlur, panel) {
+		try {
+			const actors = panelBlur.actors_list?.find(a => a.widgets?.panel === panel);
+			if (!actors || typeof panelBlur.set_should_override_panel !== 'function')
+				return;
+
+			if (panelBlur.settings?.panel?.OVERRIDE_BACKGROUND_DYNAMICALLY) {
+				// BMS decides for each panel from the windows near it
+				panelBlur.update_visibility?.();
+				return;
+			}
+
+			const styles = ['transparent-panel', 'light-panel', 'dark-panel', 'contrasted-panel'];
+			const wanted = styles.find(s => Main.panel.has_style_class_name(s));
+			const current = styles.find(s => panel.has_style_class_name(s));
+			if (wanted !== current)
+				panelBlur.set_should_override_panel(actors, wanted !== undefined);
+		} catch (e) {
+			// BMS internals changed: the panel keeps its blur without the override
+		}
+	}
+
+	showDock() {
+		if (this._settings.get_boolean(SHOW_DOCK_ID)) {
+			// Docks are created per-monitor inside _pushPanel; just rebuild if toggled.
+			if (this.mmDock.length === 0 && this._monitorIds.length > 0) {
+				let j = 0;
+				for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+					if (i !== Main.layoutManager.primaryIndex) {
+						const monitor = Main.layoutManager.monitors[i];
+						this._pushDock(monitor);
+						j++;
+					}
+				}
+			}
+		} else {
+			this.hideDock();
+		}
+	}
+
+	hideDock() {
+		while (this.mmDock.length > 0) {
+			const dock = this.mmDock.pop();
+			if (dock)
+				dock.destroy();
+		}
+	}
+
+	_pushDock(monitor) {
+		if (!this._settings.get_boolean(SHOW_DOCK_ID))
+			return;
+		const dock = new MMDock.MultiMonitorsDock(monitor, this._settings);
+		this.mmDock.push(dock);
+	}
+
+	_popDock() {
+		const dock = this.mmDock.pop();
+		if (dock)
+			dock.destroy();
+	}
+
+	showPanel() {
+		if (this._settings.get_boolean(SHOW_PANEL_ID)) {
+			if (!this._monitorsChangedId) {
+				this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', this._monitorsChanged.bind(this));
+				this._monitorsChanged();
+			}
+			if (!this._workareasChangedId) {
+				this._workareasChangedId = global.display.connect('workareas-changed',
+					this._scheduleGeometrySync.bind(this));
+			}
+			if (!this._fullscreenChangedId) {
+				this._fullscreenChangedId = global.display.connect('in-fullscreen-changed',
+					this._scheduleGeometrySync.bind(this));
+			}
+			if (!this._showAppMenuId) {
+				this._showAppMenuId = this._settings.connect('changed::' + MMPanel.SHOW_APP_MENU_ID, this._showAppMenu.bind(this));
+			}
+
+			if (!this._showDockId) {
+				this._showDockId = this._settings.connect('changed::' + SHOW_DOCK_ID, this.showDock.bind(this));
+			}
+
+			if (!this.statusIndicatorsController) {
+				this.statusIndicatorsController = new MMPanel.StatusIndicatorsController(this._settings);
+			}
+
+			if (!this._layoutManager_updateHotCorners) {
+				this._layoutManager_updateHotCorners = Main.layoutManager._updateHotCorners;
+
+				const _this = this;
+				Main.layoutManager._updateHotCorners = function () {
+					this.hotCorners.forEach((corner) => {
+						if (corner)
+							corner.destroy();
+					});
+					this.hotCorners = [];
+
+					if (!_this._desktopSettings.get_boolean(ENABLE_HOT_CORNERS)) {
+						this.emit('hot-corners-changed');
+						return;
+					}
+
+					let size = this.panelBox.height;
+
+					for (let i = 0; i < this.monitors.length; i++) {
+						let monitor = this.monitors[i];
+						let cornerX = this._rtl ? monitor.x + monitor.width : monitor.x;
+						let cornerY = monitor.y;
+
+						let corner = new Layout.HotCorner(this, monitor, cornerX, cornerY);
+						corner.setBarrierSize(size);
+						this.hotCorners.push(corner);
+					}
+
+					this.emit('hot-corners-changed');
+				};
+
+				if (!this._changedEnableHotCornersId) {
+					this._changedEnableHotCornersId = this._desktopSettings.connect('changed::' + ENABLE_HOT_CORNERS,
+						Main.layoutManager._updateHotCorners.bind(Main.layoutManager));
+				}
+
+				Main.layoutManager._updateHotCorners();
+			}
+
+			this.showDock();
+		}
+		else {
+			this.hidePanel();
+		}
+	}
+
+	hidePanel() {
+		if (this._changedEnableHotCornersId) {
+			this._desktopSettings.disconnect(this._changedEnableHotCornersId);
+			this._changedEnableHotCornersId = null;
+		}
+
+		if (this._layoutManager_updateHotCorners) {
+			Main.layoutManager['_updateHotCorners'] = this._layoutManager_updateHotCorners;
+			this._layoutManager_updateHotCorners = null;
+			Main.layoutManager._updateHotCorners();
+		}
+
+		if (this.statusIndicatorsController) {
+			this.statusIndicatorsController.destroy();
+			this.statusIndicatorsController = null;
+		}
+
+		if (this._showDockId) {
+			this._settings.disconnect(this._showDockId);
+			this._showDockId = null;
+		}
+		this.hideDock();
+
+		if (this._showAppMenuId) {
+			this._settings.disconnect(this._showAppMenuId);
+			this._showAppMenuId = null;
+		}
+		this._hideAppMenu();
+
+		if (this._monitorsChangedId) {
+			Main.layoutManager.disconnect(this._monitorsChangedId);
+			this._monitorsChangedId = null;
+		}
+		if (this._workareasChangedId) {
+			global.display.disconnect(this._workareasChangedId);
+			this._workareasChangedId = null;
+		}
+		if (this._fullscreenChangedId) {
+			global.display.disconnect(this._fullscreenChangedId);
+			this._fullscreenChangedId = null;
+		}
+
+		if (this._blurMyShellStateChangedId && Main.extensionManager) {
+			Main.extensionManager.disconnect(this._blurMyShellStateChangedId);
+			this._blurMyShellStateChangedId = null;
+		}
+
+		if (this._workareasChangedBlurId) {
+			global.display.disconnect(this._workareasChangedBlurId);
+			this._workareasChangedBlurId = null;
+		}
+
+		if (this._blurReRegisterTimeoutId) {
+			GLib.source_remove(this._blurReRegisterTimeoutId);
+			this._blurReRegisterTimeoutId = null;
+		}
+
+		// Clean up all pending blur retry timeouts
+		for (const tid of this._blurRetryTimeoutIds) {
+			GLib.source_remove(tid);
+		}
+		this._blurRetryTimeoutIds = [];
+		for (const tid of this._geometrySyncTimeoutIds) {
+			GLib.source_remove(tid);
+		}
+		this._geometrySyncTimeoutIds = [];
+
+		let panels2remove = this._monitorIds.length;
+		for (let i = 0; i < panels2remove; i++) {
+			this._monitorIds.pop();
+			this._popPanel();
+		}
+
+		// Force synchronous region update so the lock screen
+		// (shown immediately after disable) uses correct geometry.
+		if (panels2remove > 0)
+			_forceUpdateRegions();
+	}
+
+	_monitorsChanged() {
+		// If the primary monitor changed, do a full teardown + rebuild
+		const currentPrimary = Main.layoutManager.primaryIndex;
+		if (this._lastPrimaryIndex !== currentPrimary) {
+			log('[MultiMonitors] Primary index changed: ' + this._lastPrimaryIndex + ' -> ' + currentPrimary + ', full rebuild');
+			this._lastPrimaryIndex = currentPrimary;
+
+			// Full teardown of existing panels
+			let panels2remove = this._monitorIds.length;
+			for (let i = 0; i < panels2remove; i++) {
+				this._monitorIds.pop();
+				this._popPanel();
+			}
+
+			// Force synchronous layout recalculation.
+			_forceUpdateRegions();
+
+			// Rebuild from scratch for all non-primary monitors
+			for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+				if (i !== currentPrimary) {
+					let monitor = Main.layoutManager.monitors[i];
+					let monitorId = 'i' + i + 'x' + monitor.x + 'y' + monitor.y +
+						'w' + monitor.width + 'h' + monitor.height;
+					this._monitorIds.push(monitorId);
+					this._pushPanel(i, monitor);
+				}
+			}
+
+			this._showAppMenu();
+			if (this.statusIndicatorsController) {
+				this.statusIndicatorsController.transferIndicators();
+			}
+			return;
+		}
+
+		let monitorChange = Main.layoutManager.monitors.length - this._monitorIds.length - 1;
+		if (monitorChange < 0) {
+			for (let idx = 0; idx < -monitorChange; idx++) {
+				this._monitorIds.pop();
+				this._popPanel();
+			}
+			// Force synchronous layout recalculation.
+			_forceUpdateRegions();
+		}
+
+		let j = 0;
+		let tIndicators = false;
+		for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+			if (i != Main.layoutManager.primaryIndex) {
+				let monitor = Main.layoutManager.monitors[i];
+				let monitorId = "i" + i + "x" + monitor.x + "y" + monitor.y + "w" + monitor.width + "h" + monitor.height;
+				if (monitorChange > 0 && j == this._monitorIds.length) {
+					this._monitorIds.push(monitorId);
+					this._pushPanel(i, monitor);
+					tIndicators = true;
+				}
+				else if (this._monitorIds[j] != monitorId) {
+					this._monitorIds[j] = monitorId;
+					this.mmPanelBox[j].updatePanel(monitor);
+					if (this.mmDock[j])
+						this.mmDock[j].updateMonitor(monitor);
+				}
+				j++;
+			}
+		}
+		this._showAppMenu();
+		if (tIndicators && this.statusIndicatorsController) {
+			this.statusIndicatorsController.transferIndicators();
+		}
+	}
+
+	_scheduleGeometrySync() {
+		for (const tid of this._geometrySyncTimeoutIds) {
+			GLib.source_remove(tid);
+		}
+		this._geometrySyncTimeoutIds = [];
+
+		this._syncPanelsToCurrentMonitors();
+
+		for (const delay of [50, 250, 1000, 2500, 5000, 10000]) {
+			const tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+				this._syncPanelsToCurrentMonitors();
+				const idx = this._geometrySyncTimeoutIds.indexOf(tid);
+				if (idx >= 0)
+					this._geometrySyncTimeoutIds.splice(idx, 1);
+				return GLib.SOURCE_REMOVE;
+			});
+			this._geometrySyncTimeoutIds.push(tid);
+		}
+	}
+
+	_syncPanelsToCurrentMonitors() {
+		// Fullscreen transitions can emit workareas changes without a
+		// monitors-changed signal. Re-apply panel geometry explicitly.
+		let j = 0;
+		for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+			if (i === Main.layoutManager.primaryIndex)
+				continue;
+
+			const monitor = Main.layoutManager.monitors[i];
+			if (this.mmPanelBox[j]) {
+				this.mmPanelBox[j].updatePanel(monitor);
+			}
+			j++;
+		}
+
+		const mmPanelRef = getMMPanelArray();
+		if (mmPanelRef) {
+			for (const panel of mmPanelRef)
+				panel.queue_relayout();
+		}
+	}
+
+	_pushPanel(i, monitor) {
+		if (i === Main.layoutManager.primaryIndex) {
+			return;
+		}
+
+		let mmPanelBox = new MultiMonitorsPanelBox(monitor);
+		let panel = new MMPanel.MultiMonitorsPanel(i, mmPanelBox, this._settings);
+
+		this._pushDock(monitor);
+
+		const mmPanelRef = getMMPanelArray();
+		if (mmPanelRef) {
+			mmPanelRef.push(panel);
+		}
+		this.mmPanelBox.push(mmPanelBox);
+
+		if (this._settings.get_boolean('enable-blur-my-shell')) {
+			// Register with increasing delays to outlast BMS async reset cycles
+			// BMS resets on workareas-changed (which panel creation triggers),
+			// clearing all blur then re-enabling after 1ms. Longer delays ensure
+			// we re-register after BMS has fully settled.
+			const delays = [500, 2000, 4000, 6000, 10000];
+			for (const delay of delays) {
+				const tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+					this._registerPanelWithBlurMyShell(panel);
+					const idx = this._blurRetryTimeoutIds.indexOf(tid);
+					if (idx >= 0) this._blurRetryTimeoutIds.splice(idx, 1);
+					return GLib.SOURCE_REMOVE;
+				});
+				this._blurRetryTimeoutIds.push(tid);
+			}
+		}
+	}
+
+	_popPanel() {
+		const mmPanelRef = getMMPanelArray();
+		let panel = mmPanelRef ? mmPanelRef.pop() : null;
+		if (panel && this.statusIndicatorsController) {
+			this.statusIndicatorsController.transferBack(panel);
+		}
+		// Run JavaScript cleanup before destroying the containing actor.
+		panel?.destroy();
+		panel = null;
+		let mmPanelBox = this.mmPanelBox.pop();
+		if (mmPanelBox) {
+			mmPanelBox.destroy();
+		}
+		this._popDock();
+	}
+
+	_showAppMenu() {
+		// No-op for GNOME 45+
+	}
+
+	_hideAppMenu() {
+		// No-op for GNOME 45+
+	}
+}

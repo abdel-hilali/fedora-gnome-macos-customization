@@ -1,0 +1,136 @@
+<schemalist gettext-domain="gnome-shell-extensions">
+  <schema id="org.gnome.shell.extensions.multi-monitors-bar"
+    path="/org/gnome/shell/extensions/multi-monitors-bar/">
+
+    <key name="show-indicator" type="b">
+      <default>true</default>
+      <summary>Show Multi Monitors indicator on Top Panel.</summary>
+      <description>Add or remove Multi Monitors indicator from Top Panel.</description>
+    </key>
+
+    <key name="show-panel" type="b">
+      <default>true</default>
+      <summary>Show Panel on additional monitors.</summary>
+      <description>Add or remove Panel from additional monitors.</description>
+    </key>
+
+    <key name="show-activities" type="b">
+      <default>true</default>
+      <summary>Show Activities-Button on additional monitors.</summary>
+      <description>Change visibility of Activities-Button on additional monitors.</description>
+    </key>
+
+    <key name="show-app-menu" type="b">
+      <default>true</default>
+      <summary>Show AppMenu-Button on additional monitors.</summary>
+      <description>Change visibility of Activities-Button on additional monitors.</description>
+    </key>
+
+    <key name="show-date-time" type="b">
+      <default>true</default>
+      <summary>Show DateTime-Button on additional monitors.</summary>
+      <description>Change visibility of DateTime-Button on additional monitors.</description>
+    </key>
+
+    <key name="date-time-position" type="s">
+      <choices>
+        <choice value='center' />
+        <choice value='left' />
+        <choice value='right-before-tray' />
+        <choice value='right-after-tray' />
+      </choices>
+      <default>'center'</default>
+      <summary>Position of the DateTime-Button on all monitors.</summary>
+      <description>Place the button on every monitor in the center, on the left,
+        or on the right before or after Quick Settings.</description>
+    </key>
+
+    <key name="thumbnails-slider-position" type="s">
+      <choices>
+        <choice value='none' />
+        <choice value='right' />
+        <choice value='left' />
+        <choice value='auto' />
+      </choices>
+      <default>'auto'</default>
+      <summary>Show Thumbnails-Slider on additional monitors.</summary>
+      <description>Select position of Thumbnails-Slider on additional monitors.</description>
+    </key>
+
+    <key name="available-indicators" type="as">
+      <default>[]</default>
+      <summary>A list of available indicators.</summary>
+      <description>A list of indicators that are available for transfer. For internal use only.</description>
+    </key>
+
+    <key name="transfer-indicators" type="a{si}">
+      <default>{}</default>
+      <summary>A list of indicators for transfer.</summary>
+      <description>A list of indicators selected for transfer to additional Panel.</description>
+    </key>
+
+    <key name="exclude-indicators" type="as">
+      <default>['fildem-indicator']</default>
+      <summary>A list of indicators to exclude from transfer.</summary>
+      <description>Indicators in this list will never be transferred to additional panels, even if
+        they appear in available-indicators. Common values include 'fildem-indicator' for Fildem
+        menu.</description>
+    </key>
+
+    <key name="enable-blur-my-shell" type="b">
+      <default>true</default>
+      <summary>Enable Blur my Shell integration.</summary>
+      <description>Automatically register secondary panels with Blur my Shell extension for blur
+        effects.</description>
+    </key>
+
+    <key name="screenshot-on-all-monitors" type="b">
+      <default>false</default>
+      <summary>Show screenshot tools on all monitors.</summary>
+      <description>When enabled, the screenshot UI tools will be shown on all monitors
+        simultaneously. When disabled, they appear only on the monitor where the cursor is.</description>
+    </key>
+
+    <key name="force-workspaces-on-all-displays" type="b">
+      <default>true</default>
+      <summary>Force workspaces on all displays.</summary>
+      <description>When enabled, the extension forces GNOME's workspace setting to span all
+        displays. Disabling this may affect the workspaces thumbnail slider on secondary monitors.</description>
+    </key>
+
+    <key name="show-overview-on-extended-monitors" type="b">
+      <default>true</default>
+      <summary>Show App Grid and Search on extended monitors.</summary>
+      <description>When enabled, the custom overview (App Grid and Search) is shown on extended
+        monitors. Disabling this completely hides the overview from secondary displays.</description>
+    </key>
+
+    <key name="panel-color" type="s">
+      <default>''</default>
+      <summary>Custom panel background color for additional monitors.</summary>
+      <description>An RGBA color string (e.g. 'rgba(45,45,45,0.9)') to use as the background
+        color for panels on additional monitors. An empty string means use the default system
+        theme color.</description>
+    </key>
+
+    <key name="show-dock-on-extended-monitors" type="b">
+      <default>false</default>
+      <summary>Show dock on extended monitors.</summary>
+      <description>When enabled, a native GNOME application dock is shown at the bottom
+        of each extended monitor while the Activities overview is open, mirroring the
+        main monitor overview dash. With reveal-dock-on-hover enabled, it also appears
+        on the desktop when the pointer reaches the bottom edge beneath the dock.</description>
+    </key>
+
+    <key name="reveal-dock-on-hover" type="b">
+      <default>false</default>
+      <summary>Reveal the dock when hovering over the bottom edge.</summary>
+      <description>Reveal the dock on the primary monitor by hovering over the
+        bottom edge beneath it, including when only one display is connected.
+        Also applies to extended monitors when show-dock-on-extended-monitors
+        is enabled. Hide the dock shortly after the pointer leaves. Disable
+        this to keep docks visible only in the Activities overview.</description>
+    </key>
+
+  </schema>
+</schemalist>

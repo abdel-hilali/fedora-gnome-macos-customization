@@ -1,0 +1,164 @@
+/* Multi-monitor panel styling - matches main panel via .panel class */
+.multimonitor-panel {
+    margin: 0px !important;
+    padding-top: 0px !important;
+    padding-bottom: 0px !important;
+}
+
+.helloworld-label {
+    font-size: 72px;
+    font-weight: bold;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.5);
+    border-radius: 5px;
+    padding: .5em;
+}
+
+.multimonitor-spacer {
+    height: 4em;
+}
+
+.multimonitor-status-indicators-box {
+    gap: 0px;
+}
+
+.multimonitor-status-icon {
+    padding: 0 2px;
+}
+
+.workspace-thumbnails-left {
+    border-radius: 0 9px 9px 0;
+}
+
+.workspace-thumbnails-left:rtl {
+    border-radius: 9px 0 0 9px;
+}
+
+/* Mirrored indicators should inherit styling from their cloned source.
+   The Clutter.Clone automatically scales content, ensuring proper font sizes. */
+
+/* Activities button styling for external monitors */
+/* Activities/Workspace indicator - full height hover like main panel */
+#mmPanelActivities,
+.mm-activities {
+    padding: 0 12px;
+}
+
+#mmPanelActivities:hover,
+.mm-activities:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+#mmPanelActivities:active,
+#mmPanelActivities:overview,
+.mm-activities:active,
+.mm-activities:checked {
+    background-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Padding for mirrored indicators (e.g., Vitals extension) */
+.panel-status-menu-box {
+    padding: 0px 2px;
+    min-height: 24px;
+}
+
+/* Quick Settings (system tray) in extended monitor - consistent padding */
+.mm-quick-settings {
+    padding: 0 8px;
+    -natural-hpadding: 8px;
+    -minimum-hpadding: 8px;
+}
+
+.mm-quick-settings-box {
+    padding: 0 6px;
+    margin: 0;
+}
+
+/* Clipping container for system tray - SAME padding as normal mode */
+.mm-quick-settings-clip {
+    padding: 0 6px;
+    margin: 0;
+}
+
+/* Normal and overview states should have SAME padding for consistency */
+.mm-quick-settings-normal,
+.mm-quick-settings-overview {
+    padding: 0 6px;
+}
+
+/* Favorites menu in extended monitor - full height */
+.mm-favorites-menu {
+    padding: 0 4px;
+    -natural-hpadding: 4px;
+    -minimum-hpadding: 4px;
+}
+
+.mm-favorites-menu-box {
+    padding: 0;
+    margin: 0;
+}
+
+/* System tray icons in extended monitor - prevent shrinking */
+.multimonitor-status-indicators-box .panel-button,
+.multimonitor-status-indicators-box .system-status-icon {
+    min-height: 30px;
+    padding: 4px 8px;
+}
+
+.mm-clipboard-indicator-copy {
+    min-width: 0;
+    padding: 0 4px;
+}
+
+.multimonitor-status-indicators-box .mm-clipboard-indicator-copy .system-status-icon {
+    min-height: 0;
+    padding: 0;
+}
+
+/* Fallback styling for locally-rendered Workspace Indicator previews on
+   secondary panels. These match GNOME's Workspace Indicator classes so the
+   official extension stylesheet still wins when it is loaded. */
+.mm-workspace-indicator.previews:active {
+    background-color: transparent !important;
+    box-shadow: none !important;
+}
+
+.mm-workspace-indicator {
+    min-height: 30px;
+}
+
+.mm-workspace-indicator .workspaces-box {
+    spacing: 3px;
+    min-height: 30px;
+}
+
+.mm-workspace-indicator .workspace-box {
+    padding-top: 5px;
+    padding-bottom: 5px;
+    min-height: 30px;
+}
+
+.mm-workspace-indicator .workspace {
+    width: 52px;
+    min-height: 18px;
+    height: 18px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background-color: #3f3f3f;
+}
+
+.mm-workspace-indicator .workspace.active {
+    border-color: #fff;
+}
+
+.workspace-indicator-window-preview {
+    background-color: #bebebe;
+    border: 1px solid #828282;
+    border-radius: 1px;
+    min-height: 1px;
+    min-width: 1px;
+}
+
+.workspace-indicator-window-preview.active {
+    background-color: #d4d4d4;
+}

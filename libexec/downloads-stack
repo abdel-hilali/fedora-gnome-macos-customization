@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# downloads-stack: helper for the Downloads launcher in the dock.
+#   toggle         fan out the newest downloads (Downloads Fan extension); open the folder
+#                  when the extension is off
+#   open-folder    open the Downloads folder
+#   open-latest    open the newest finished download with its default app
+#   reveal-latest  show the newest finished download in Files
+#   print-latest   print its path (for testing)
+# Partial downloads (*.part, *.crdownload) and hidden files are skipped.
+# DOWNLOADS_STACK_DIR overrides the folder (for testing).
+
+dir=${DOWNLOADS_STACK_DIR:-$(xdg-user-dir DOWNLOAD 2>/dev/null)}
+[ -d "$dir" ] || dir=$HOME/Downloads
+
+# NUL-separated all the way, so any filename is safe.
+latest=
+IFS= read -r -d '' latest < <(
+    find "$dir" -maxdepth 1 -type f ! -name '.*' ! -name '*.part' ! -name '*.crdownload' \
+        -printf '%T@\t%p\0' | sort -z -rn | head -z -n 1 | cut -z -f2-
+)
+
+case ${1:-} in
+    toggle)
+        gdbus call --session --timeout 3 --dest org.macstyle.DownloadsFan \
+            --object-path /org/macstyle/DownloadsFan --method org.macstyle.DownloadsFan.Toggle \
+            >/dev/null 2>&1 || exec gio open "$dir" ;;
+    open-folder)
+        exec gio open "$dir" ;;
+    open-latest)
+        if [ -n "$latest" ]; then exec gio open "$latest"; else exec gio open "$dir"; fi ;;
+    reveal-latest)
+        if [ -n "$latest" ]; then exec nautilus --select "$latest"; else exec gio open "$dir"; fi ;;
+    print-latest)
+        printf '%s\n' "$latest" ;;
+    *)
+        echo "usage: ${0##*/} toggle|open-folder|open-latest|reveal-latest|print-latest" >&2
+        exit 2 ;;
+esac

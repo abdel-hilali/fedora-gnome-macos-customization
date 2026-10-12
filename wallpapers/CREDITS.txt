@@ -1,0 +1,14 @@
+Wallpapers in this folder
+
+From KDE Plasma (https://invent.kde.org/plasma/plasma-workspace-wallpapers),
+licence CC-BY-SA-4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
+
+mountain-l/d     "Mountain" by Andy Betts
+sub-arctic-l/d   "Sub-Arctic" by Krystian Zajdel
+coast-l/d        "Coast" by Krystian Zajdel
+waterfall-l/d    "Waterfall" by Krystian Zajdel
+orionids-l/d     "Orionids" by Krystian Zajdel
+nuvole-l/d       "Nuvole" by Krystian Zajdel
+
+Changes: day (-l) and night (-d) pictures scaled and cropped from 5120x2880 PNG to
+3840x2160 JPEG. These changed pictures are shared under the same licence, CC-BY-SA-4.0.

@@ -1,0 +1,357 @@
+"use strict";
+import St from "gi://St";
+import * as Main from "resource:///org/gnome/shell/ui/main.js";
+import * as Panel from "resource:///org/gnome/shell/ui/panel.js";
+import { Extension } from "resource:///org/gnome/shell/extensions/extension.js";
+import BoxOrderManager from "./extensionModules/BoxOrderManager.js";
+import { FAMILIES, familyOrderKey } from "./Families.js";
+/**
+ * Finds the uuid of the extension whose code is calling into the current
+ * call stack, if any, by looking for the first stack frame under an
+ * `extensions/<uuid>/` path other than `ownUuid`.
+ * Used since some extensions' role names are not a stable way to recognize
+ * which "family" an item belongs to (see `BoxOrderManager`'s `Family`
+ * mechanism) — e.g. tasks-in-panel@fthx names each item `taskButton${windowId}`,
+ * a new value every time a window opens. Which extension's code added the
+ * item is stable regardless of what it names that item.
+ * @param {string | undefined} stack - A stack trace, as produced by `new Error().stack`.
+ * @param {string} ownUuid - This extension's own uuid, so its own frames
+ * (e.g. the override calling this) are skipped rather than misidentified.
+ * @returns {string | null} The first other extension's uuid found in the
+ * stack, or `null` if none could be determined (e.g. a core GNOME Shell
+ * component added the item, or the stack format didn't match).
+ */
+function extractCreatorExtensionUuid(stack, ownUuid) {
+    if (!stack) {
+        return null;
+    }
+    for (const line of stack.split("\n")) {
+        const match = line.match(/\/extensions\/([^/]+)\//);
+        if (match && match[1] !== ownUuid) {
+            return match[1];
+        }
+    }
+    return null;
+}
+export default class TopBarOrganizerExtension extends Extension {
+    _settings;
+    _boxOrderManager;
+    // Roles of AppIndicator/KStatusNotifierItem items already given their
+    // one-shot "safe" mode placement this session. In-memory only, same as
+    // the pre-persistence Task Up UltraLite role tracking used to be — cheap
+    // to re-derive every session, and there is nothing to persist since
+    // "safe" mode never repositions an icon a second time anyway.
+    #placedAppIndicatorRoles = new Set();
+    // Cleanup actions for whatever `enable()` has set up so far, in setup
+    // order. GNOME Shell doesn't guarantee `disable()` only ever follows a
+    // successful `enable()` 1:1 (its own extensionSystem.js leaves a failed
+    // enable() stuck mid-state and can still invoke disable() unconditionally
+    // from its "rebase" mechanism, relevant here since this extension patches
+    // Panel.prototype._addToPanelBox). Tracking exactly what succeeded, rather
+    // than guessing from instance-field nullness, means `disable()` — called
+    // any number of times, from any point `enable()` may have reached — only
+    // ever undoes what actually happened.
+    #teardowns = [];
+    #withTeardown(setup, teardown) {
+        const result = setup();
+        this.#teardowns.push(teardown);
+        return result;
+    }
+    enable() {
+        try {
+            this._settings = this.#withTeardown(() => this.getSettings(), ext => {
+                ext._settings.disconnectObject(ext);
+                // @ts-ignore
+                ext._settings = null;
+            });
+            this._boxOrderManager = this.#withTeardown(() => new BoxOrderManager({}, this._settings), ext => {
+                ext._boxOrderManager.disconnectObject(ext);
+                ext._boxOrderManager.disconnectSignals();
+                // @ts-ignore
+                ext._boxOrderManager = null;
+            });
+            /// Stuff to do on startup(extension enable).
+            // Initially handle new top bar items and order top bar boxes.
+            this.#handleNewItemsAndOrderTopBar();
+            // Overwrite the `Panel._addToPanelBox` method with one handling
+            // new items.
+            this.#withTeardown(() => this.#overwritePanelAddToPanelBox(), _ext => {
+                // @ts-ignore
+                Panel.Panel.prototype._addToPanelBox = Panel.Panel.prototype._originalAddToPanelBox;
+                // @ts-ignore
+                Panel.Panel.prototype._originalAddToPanelBox = undefined;
+            });
+            // Handle AppIndicators getting ready (relevant to "full" mode), to
+            // handle new AppIndicator items once their application can be
+            // determined.
+            this._boxOrderManager.connectObject("appIndicatorReady", () => {
+                this.#handleNewItemsAndOrderTopBar();
+            }, this);
+            // Handle changes of settings. A family's member order lives in
+            // its own `family-order-${id}` key, separate from the box-order
+            // keys below — reordering members within a family (e.g. on the
+            // Groups page) only ever touches this key, so without a handler
+            // for it that reordering never triggers a re-order of the actual
+            // top bar.
+            [
+                "left-box-order",
+                "center-box-order",
+                "right-box-order",
+                "hide",
+                "show",
+                "appindicator-order-mode",
+                "appindicator-order-exceptions",
+                ...FAMILIES.map(family => familyOrderKey(family.id)),
+            ].forEach(settingsName => {
+                this._settings.connectObject(`changed::${settingsName}`, () => {
+                    this.#handleNewItemsAndOrderTopBar();
+                }, this);
+            });
+        }
+        catch (e) {
+            this.disable();
+            throw e;
+        }
+    }
+    disable() {
+        this.#teardowns.splice(0).reverse().forEach(teardown => teardown(this));
+    }
+    ////////////////////////////////////////////////////////////////////////////
+    /// Methods used on extension enable.                                    ///
+    ////////////////////////////////////////////////////////////////////////////
+    /**
+     * Overwrite `Panel._addToPanelBox` with a custom method, which simply calls
+     * the original one and handles new items and orders the top bar afterwards.
+     */
+    #overwritePanelAddToPanelBox() {
+        // Add the original `Panel._addToPanelBox` method as
+        // `Panel._originalAddToPanelBox`.
+        // @ts-ignore
+        Panel.Panel.prototype._originalAddToPanelBox = Panel.Panel.prototype._addToPanelBox;
+        const handleNewItemsAndOrderTopBar = () => {
+            this.#handleNewItemsAndOrderTopBar();
+        };
+        const recordItemCreator = (role) => {
+            // Captured here, since this is called synchronously from within
+            // the override below, which is itself called synchronously by
+            // whichever extension is adding this role — the creator's stack
+            // frame is present up the call chain at this exact point.
+            const creatorUuid = extractCreatorExtensionUuid(new Error().stack, this.uuid);
+            this._boxOrderManager.recordItemCreator(role, creatorUuid);
+        };
+        const handleSafeModeAppIndicatorPlacement = (role, box) => {
+            this.#handleSafeModeAppIndicatorPlacement(role, box);
+        };
+        // Overwrite `Panel._addToPanelBox`.
+        Panel.Panel.prototype._addToPanelBox = function (role, indicator, position, box) {
+            // Simply call the original `_addToPanelBox` and order the top bar
+            // and handle new items afterwards.
+            // @ts-ignore
+            this._originalAddToPanelBox(role, indicator, position, box);
+            recordItemCreator(role);
+            if (role.startsWith("appindicator-")) {
+                // A deliberately separate, self-contained mechanism from the
+                // box-order reorder loop below (see
+                // `#handleSafeModeAppIndicatorPlacement`) — that loop
+                // reparents everything in its resolved list on every call
+                // regardless of whether an item changed, which is exactly
+                // the pattern that crashed gnome-shell for tray icons before.
+                handleSafeModeAppIndicatorPlacement(role, box);
+            }
+            handleNewItemsAndOrderTopBar();
+        };
+    }
+    ////////////////////////////////////////////////////////////////////////////
+    /// Helper methods holding logic needed by other methods.                ///
+    ////////////////////////////////////////////////////////////////////////////
+    /**
+     * Finds the role of the given indicator container by looking it up in
+     * `Main.panel.statusArea`.
+     * @param {St.Bin} container - The indicator container to find the role of.
+     * @returns {string | undefined} The role, if found.
+     */
+    #findRoleForContainer(container) {
+        for (const role in Main.panel.statusArea) {
+            if (Main.panel.statusArea[role]?.container === container) {
+                return role;
+            }
+        }
+        return undefined;
+    }
+    /**
+     * Implements "safe" mode AppIndicator/KStatusNotifierItem ordering: the
+     * first time a given tray role is seen, its container is moved (once)
+     * adjacent to the last other tray icon already present in the same box,
+     * then never touched again. If no other tray icon is present in the box
+     * yet, the icon is left wherever `Panel._addToPanelBox` already put it.
+     *
+     * Why this is needed at all: the AppIndicator/KStatusNotifierItem
+     * extension itself always adds its icons at the same fixed `position`
+     * argument (see its `indicatorStatusIcon.js`), so left alone, GNOME
+     * Shell's default same-position insertion order would already keep tray
+     * icons adjacent to each other. What actually scatters them is *this*
+     * extension's own `#orderTopBarItems` reordering everything in
+     * `left/center/right-box-order` on every pass (e.g. whenever some
+     * unrelated item elsewhere in the same box gets moved) — since tray
+     * items are never part of that list, they have no say in where a
+     * reparent of some other item leaves them. This method re-clusters them
+     * back together each time a *new* one appears, without needing to track
+     * or replay a persisted order.
+     *
+     * This is deliberately separate from `#orderTopBarItems`'s resolved-order
+     * reorder loop, which reparents everything in its list on every call
+     * regardless of whether a given item actually changed position — folding
+     * tray items into that loop would reparent them on unrelated panel
+     * events too, reintroducing the exact crash mechanism (reparenting a
+     * disposed tray container) this fork otherwise avoids for tray icons.
+     * @param {string} role - The role of the newly added item.
+     * @param {St.BoxLayout} box - The top bar box the item was added to.
+     */
+    #handleSafeModeAppIndicatorPlacement(role, box) {
+        if (this._settings.get_string("appindicator-order-mode") !== "safe") {
+            return;
+        }
+        if (this.#placedAppIndicatorRoles.has(role)) {
+            return;
+        }
+        // Mark as placed regardless of whether an anchor is found below —
+        // this is the one and only placement decision made for this role's
+        // entire lifetime.
+        this.#placedAppIndicatorRoles.add(role);
+        const container = Main.panel.statusArea[role]?.container;
+        if (!(container instanceof St.Bin)) {
+            // TODO: maybe add logging
+            return;
+        }
+        // Find the last other tray icon already present in this box.
+        let anchorContainer = null;
+        for (const child of box.get_children()) {
+            if (!(child instanceof St.Bin) || child === container) {
+                continue;
+            }
+            if (this.#findRoleForContainer(child)?.startsWith("appindicator-")) {
+                anchorContainer = child;
+            }
+        }
+        if (anchorContainer === null) {
+            // No other tray icon placed in this box yet to anchor to.
+            return;
+        }
+        const parent = container.get_parent();
+        if (parent !== null) {
+            parent.remove_child(container);
+        }
+        // Re-derive the anchor's index now that `container` has been
+        // removed, since removal may have shifted it.
+        const anchorIndex = box.get_children().indexOf(anchorContainer);
+        box.insert_child_at_index(container, anchorIndex + 1);
+    }
+    /**
+     * This method orders the top bar items of the specified box according to
+     * the configured box orders.
+     * @param {Box} box - The box to order.
+     */
+    #orderTopBarItems(box) {
+        // Only run, when the session mode is "user" or the parent session mode
+        // is "user".
+        if (Main.sessionMode.currentMode !== "user" && Main.sessionMode.parentMode !== "user") {
+            return;
+        }
+        // Get the valid box order.
+        const validBoxOrder = this._boxOrderManager.getValidBoxOrder(box);
+        // Get the relevant box of `Main.panel`.
+        let panelBox = Main.panel[`_${box}Box`];
+        /// Go through the items of the validBoxOrder and order the GNOME Shell
+        /// top bar box accordingly.
+        for (let i = 0; i < validBoxOrder.length; i++) {
+            const item = validBoxOrder[i];
+            // Get the indicator container associated with the current role.
+            const associatedIndicatorContainer = Main.panel.statusArea[item.role]?.container;
+            if (!(associatedIndicatorContainer instanceof St.Bin)) {
+                // TODO: maybe add logging
+                continue;
+            }
+            // Save whether or not the indicator container is visible.
+            const isVisible = associatedIndicatorContainer.visible;
+            // For the left/center boxes, `i` is a concrete target index, so
+            // it's possible to tell in advance whether reparenting would
+            // actually be a no-op and skip it — avoids touching the Clutter
+            // actor tree at all on reorder passes triggered by unrelated
+            // events (e.g. any other item being added anywhere in the top
+            // bar) once this item is already correctly placed.
+            // Not done for the right box: it always inserts at index `-1`
+            // ("whatever the end of the box's children currently is, right
+            // now"), not a fixed index, so there's no equally simple way to
+            // tell in advance whether a given item's insert this pass would
+            // actually be a no-op.
+            const alreadyAtIndex = box !== "right" && panelBox.get_child_at_index(i) === associatedIndicatorContainer;
+            // "full" mode AppIndicator/KStatusNotifierItem items can be
+            // individually excluded from reordering (residual-risk opt-in
+            // left for the user to control per app). Skipping the reparent
+            // for one entry doesn't require recomputing indices for the
+            // others: they still get placed correctly around it, this one
+            // just keeps whatever position it currently has.
+            const applicationId = this._boxOrderManager.getAppIndicatorApplicationId(item.role);
+            const isExcepted = applicationId !== undefined &&
+                this._settings.get_strv("appindicator-order-exceptions").includes(applicationId);
+            if (!alreadyAtIndex && !isExcepted) {
+                const parent = associatedIndicatorContainer.get_parent();
+                if (parent !== null) {
+                    parent.remove_child(associatedIndicatorContainer);
+                }
+                if (box === "right") {
+                    // If the target panel box is the right panel box, insert the
+                    // indicator container at index `-1`, which just adds it to the
+                    // end (correct order is ensured, since `validBoxOrder` is
+                    // sorted correctly and we're looping over it in order).
+                    // This way unaccounted-for indicator containers will be at the
+                    // left, which is preferred, since the box is logically
+                    // right-to-left.
+                    // The same applies for indicator containers, which are just
+                    // temporarily unaccounted for (like for indicator containers of
+                    // not yet ready app indicators), since them being at the right
+                    // for a probably temporary stay causes all the indicator
+                    // containers to shift.
+                    panelBox.insert_child_at_index(associatedIndicatorContainer, -1);
+                }
+                else {
+                    panelBox.insert_child_at_index(associatedIndicatorContainer, i);
+                }
+            }
+            // Hide the indicator container...
+            // - ...if it wasn't visible before and the hide property of the
+            //   item is "default".
+            // - if the hide property of the item is "hide".
+            // In all other cases have the item show.
+            // An e.g. screen recording indicator still wouldn't show tho, since
+            // this here acts on the indicator container, but a screen recording
+            // indicator is hidden on the indicator level.
+            if ((!isVisible && item.hide === "default") ||
+                item.hide === "hide") {
+                associatedIndicatorContainer.hide();
+            }
+        }
+        // To handle the case, where the box order got set to a permutation
+        // of an outdated box order, it would be wise, if the caller updated the
+        // box order now to include the items present in the top bar.
+    }
+    /**
+     * This method handles all new items currently present in the top bar and
+     * orders the items of all top bar boxes.
+     */
+    #handleNewItemsAndOrderTopBar() {
+        // Only run, when the session mode is "user" or the parent session mode
+        // is "user".
+        if (Main.sessionMode.currentMode !== "user" && Main.sessionMode.parentMode !== "user") {
+            return;
+        }
+        this._boxOrderManager.saveNewTopBarItems();
+        this.#orderTopBarItems("left");
+        this.#orderTopBarItems("center");
+        this.#orderTopBarItems("right");
+        // In `this.#orderTopBarItems` it says to update the box orders to
+        // include potentially new items, since the ordering might have been
+        // based on an outdated box order. However, since we already handle new
+        // top bar items at the beginning of this method, this isn't a concern.
+    }
+}

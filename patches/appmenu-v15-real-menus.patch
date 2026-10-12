@@ -1,0 +1,2001 @@
+diff --git a/gtkMenuBar.js b/gtkMenuBar.js
+new file mode 100644
+index 0000000..0926bbb
+--- /dev/null
++++ b/gtkMenuBar.js
+@@ -0,0 +1,432 @@
++// Reader for a menu bar that a GTK program publishes on the session bus.
++//
++// Programs with a classic menu bar that are built on GTK (LibreOffice, GIMP,
++// Inkscape …) export it as org.gtk.Menus and the commands behind it as
++// org.gtk.Actions. The window tells the compositor the bus name and the object
++// paths, so nothing has to register: the window says where its menu is.
++// LibreOffice takes its own menu bar out of the window as soon as a menu
++// registrar is on the bus, and expects the desktop to show this one instead.
++//
++// A menu like that has many hundreds of entries and changes while one works
++// (LibreOffice renames "Undo" with every word typed). So the reader keeps the
++// whole menu loaded and watched, which is cheap, and makes the entries of one
++// menu only when asked: the top-level menus and every submenu come with a
++// function that lists their entries as they are at that moment.
++
++import Gio from 'gi://Gio';
++import GLib from 'gi://GLib';
++import * as Logger from './logger.js';
++import { _ } from './i18n.js';
++import { normalizeLabel, acceleratorLabel } from './menuText.js';
++
++// A submenu that stays silent this long after it was asked for is empty.
++const LOAD_WAIT_MS = 400;
++const MAX_NESTING = 16;
++const MAX_ROWS = 2000;      // entries of one menu
++const MAX_MODELS = 6000;    // menus and sections of one menu bar
++const COMPACT_AT = 1024;
++const STRING = new GLib.VariantType('s');
++
++function _now() {
++    return GLib.get_monotonic_time() / 1000;
++}
++
++function _text(model, index, attribute) {
++    const value = model.get_item_attribute_value(index, attribute, STRING);
++    return value ? value.get_string()[0] : '';
++}
++
++export class GtkMenuBar {
++    // where: { busName, menubarPath, windowPath, applicationPath }
++    // onChanged() is called whenever the menu or one of its commands changed.
++    constructor(where, onChanged) {
++        this.busName = where.busName;
++        this.menubarPath = where.menubarPath;
++        this._onChanged = onChanged;
++        this._models = new Map();   // menu model -> { signalId, askedAt, arrived, nesting }
++        this._groups = new Map();   // action prefix -> { group, signalIds }
++        this._opened = new Map();   // place of a submenu -> the command that was told "open"
++        this._asked = new Set();    // commands of empty submenus that were asked for entries
++        this._compactAt = COMPACT_AT;
++
++        this._root = Gio.DBusMenuModel.get(Gio.DBus.session, where.busName, where.menubarPath);
++        this._addGroup('win', where.windowPath);
++        this._addGroup('app', where.applicationPath);
++        this._follow(this._root, 0, false);
++    }
++
++    // The top-level menus: [{ label, children(), onOpen(), onClose() }].
++    buildMenus() {
++        const menus = [];
++        if (!this._root)
++            return menus;
++
++        const seen = new Map();
++        for (const { model, index } of this._rows(this._root, 0)) {
++            if (!model.get_item_link(index, 'submenu'))
++                continue;
++
++            const label = normalizeLabel(_text(model, index, 'label'));
++            const nth = seen.get(label) ?? 0;
++            seen.set(label, nth + 1);
++            if (label)
++                menus.push(this._submenuEntry(label, [{ label, nth }]));
++        }
++        return menus;
++    }
++
++    destroy() {
++        for (const action of this._opened.values())
++            this._tell(action, false);
++        this._opened.clear();
++
++        for (const [model, entry] of this._models) {
++            try { model.disconnect(entry.signalId); } catch (_e) { /* ignore */ }
++        }
++        this._models.clear();
++        for (const entry of this._groups.values()) {
++            for (const id of entry.signalIds) {
++                try { entry.group.disconnect(id); } catch (_e) { /* ignore */ }
++            }
++        }
++        this._groups.clear();
++        this._root = null;
++        this._onChanged = null;
++    }
++
++    // ── loading and watching ──────────────────────────────────────────
++
++    _addGroup(prefix, path) {
++        if (!path)
++            return;
++
++        try {
++            const group = Gio.DBusActionGroup.get(Gio.DBus.session, this.busName, path);
++            const signalIds = ['action-added', 'action-removed', 'action-enabled-changed', 'action-state-changed']
++                .map(signal => group.connect(signal, () => this._changed()));
++            // The first question starts the subscription; the answer comes as signals.
++            group.list_actions();
++            this._groups.set(prefix, { group, signalIds });
++        } catch (e) {
++            Logger.debug(`No actions at ${this.busName}${path}: ${e}`);
++        }
++    }
++
++    // Loads and watches every menu below `model`. A menu is sent when it is
++    // first asked for, one answer per submenu, so the walk goes on from each
++    // answer (_onItemsChanged). A section travels with the menu it is part
++    // of: it is there when that menu is, also when it is empty and silent.
++    _follow(model, nesting, arrivedWithParent) {
++        const entry = this._track(model, nesting);
++        if (!entry || nesting > MAX_NESTING)
++            return;
++        if (arrivedWithParent)
++            entry.arrived = true;
++
++        const count = model.get_n_items();
++        for (let index = 0; index < count; index++) {
++            const section = model.get_item_link(index, 'section');
++            if (section) {
++                this._follow(section, nesting + 1, entry.arrived);
++                continue;
++            }
++            const submenu = model.get_item_link(index, 'submenu');
++            if (submenu && !this._models.has(submenu))
++                this._follow(submenu, nesting + 1, false);
++        }
++    }
++
++    _track(model, nesting) {
++        let entry = this._models.get(model);
++        if (entry)
++            return entry;
++        if (this._models.size >= MAX_MODELS)
++            return null;
++
++        entry = { signalId: 0, askedAt: _now(), arrived: false, nesting };
++        entry.signalId = model.connect('items-changed', () => this._onItemsChanged(model, entry));
++        // As for the actions: asking starts the subscription.
++        entry.arrived = model.get_n_items() > 0;
++        this._models.set(model, entry);
++        return entry;
++    }
++
++    _onItemsChanged(model, entry) {
++        entry.arrived = true;
++        this._follow(model, entry.nesting, false);
++        if (this._models.size > this._compactAt)
++            this._compact();
++        this._changed();
++    }
++
++    // The program replaces parts of its menu; let go of the parts that left.
++    _compact() {
++        const reachable = new Set();
++        const visit = (model, nesting) => {
++            if (reachable.has(model) || !this._models.has(model) || nesting > MAX_NESTING)
++                return;
++
++            reachable.add(model);
++            const count = model.get_n_items();
++            for (let index = 0; index < count; index++) {
++                for (const link of ['section', 'submenu']) {
++                    const linked = model.get_item_link(index, link);
++                    if (linked)
++                        visit(linked, nesting + 1);
++                }
++            }
++        };
++        visit(this._root, 0);
++
++        for (const [model, entry] of this._models) {
++            if (reachable.has(model))
++                continue;
++            try { model.disconnect(entry.signalId); } catch (_e) { /* ignore */ }
++            this._models.delete(model);
++        }
++        this._compactAt = Math.max(COMPACT_AT, this._models.size * 2);
++    }
++
++    _changed() {
++        try {
++            this._onChanged?.();
++        } catch (e) {
++            Logger.error(`GTK menu bar callback failed: ${e}`);
++        }
++    }
++
++    // ── menu tree ─────────────────────────────────────────────────────
++
++    // The rows of a menu in the order they show. A menu is a row of sections,
++    // each a menu of its own; the separators go between the sections.
++    *_rows(model, nesting, state = { section: 0, count: 0 }) {
++        if (nesting > MAX_NESTING)
++            return;
++
++        const count = model.get_n_items();
++        for (let index = 0; index < count && state.count < MAX_ROWS; index++) {
++            const section = model.get_item_link(index, 'section');
++            if (!section) {
++                state.count++;
++                yield { model, index, section: state.section, heading: '' };
++                continue;
++            }
++
++            state.section++;
++            let heading = normalizeLabel(_text(model, index, 'label'));
++            for (const row of this._rows(section, nesting + 1, state)) {
++                row.heading ||= heading;
++                heading = '';
++                yield row;
++            }
++            state.section++;
++        }
++    }
++
++    _children(model, path) {
++        const children = [];
++        const seen = new Map();
++        let section = null;
++        for (const row of this._rows(model, path.length)) {
++            const entry = this._entry(row, path, seen);
++            if (!entry)
++                continue;
++
++            if (row.section !== section) {
++                if (children.length > 0)
++                    children.push({ type: 'separator' });
++                if (row.heading)
++                    children.push({ type: 'section-header', label: row.heading });
++                section = row.section;
++            }
++            children.push(entry);
++        }
++        return children;
++    }
++
++    _entry({ model, index }, path, seen) {
++        const label = normalizeLabel(_text(model, index, 'label'));
++        const submenu = model.get_item_link(index, 'submenu');
++        if (!submenu)
++            return label ? this._commandEntry(model, index, label) : null;
++
++        const nth = seen.get(label) ?? 0;
++        seen.set(label, nth + 1);
++        if (!this._hasEntries(submenu, path.length + 1)) {
++            this._askOnce(submenu, _text(model, index, 'submenu-action'));
++            return { label: label || _('More'), sensitive: false };
++        }
++        return this._submenuEntry(label || _('More'), [...path, { label, nth }]);
++    }
++
++    // A submenu is known by its place: the labels on the way down from the
++    // menu bar (and which one, if a label comes twice). The program may put
++    // new objects there at any time, so the place is looked up when needed.
++    _submenuEntry(label, path) {
++        return {
++            type: 'submenu',
++            label,
++            children: () => this._childrenAt(path),
++            onOpen: () => this._setOpenAt(path, true),
++            onClose: () => this._setOpenAt(path, false),
++        };
++    }
++
++    _commandEntry(model, index, label) {
++        const action = _text(model, index, 'action');
++        const target = model.get_item_attribute_value(index, 'target', null);
++        const command = this._command(action, target);
++        const hiddenWhen = _text(model, index, 'hidden-when');
++        if ((hiddenWhen === 'action-missing' && !command.exists)
++            || (hiddenWhen === 'action-disabled' && !command.enabled))
++            return null;
++
++        return {
++            label,
++            sensitive: command.enabled,
++            ornament: command.ornament,
++            shortcut: acceleratorLabel(_text(model, index, 'accel')),
++            activate: () => this._activate(action, target),
++        };
++    }
++
++    _hasEntries(model, nesting) {
++        for (const { model: menu, index } of this._rows(model, nesting)) {
++            if (menu.get_item_link(index, 'submenu'))
++                return true;
++            const label = normalizeLabel(_text(menu, index, 'label'));
++            if (label && this._commandEntry(menu, index, label))
++                return true;
++        }
++        return false;
++    }
++
++    // The submenu at a place, with the command it wants to hear from: { submenu, action }.
++    _submenuAt(path) {
++        let model = this._root;
++        let found = null;
++        for (let depth = 0; depth < path.length && model; depth++) {
++            const step = path[depth];
++            found = null;
++            let fallback = null;
++            let nth = 0;
++            for (const { model: menu, index } of this._rows(model, depth)) {
++                const submenu = menu.get_item_link(index, 'submenu');
++                if (!submenu || normalizeLabel(_text(menu, index, 'label')) !== step.label)
++                    continue;
++
++                const candidate = { submenu, action: _text(menu, index, 'submenu-action') };
++                fallback ??= candidate;
++                if (nth++ === step.nth) {
++                    found = candidate;
++                    break;
++                }
++            }
++            found ??= fallback;
++            model = found?.submenu ?? null;
++        }
++        return found;
++    }
++
++    _childrenAt(path) {
++        const found = this._submenuAt(path);
++        return found ? this._children(found.submenu, path) : [];
++    }
++
++    // ── commands ──────────────────────────────────────────────────────
++
++    // "win.save" is the command "save" of the window, "app.quit" one of the program.
++    _resolve(action) {
++        const dot = String(action ?? '').indexOf('.');
++        if (dot <= 0)
++            return [null, ''];
++        return [this._groups.get(action.slice(0, dot))?.group ?? null, action.slice(dot + 1)];
++    }
++
++    // Whether a command can be used now, and the mark its entry carries. The
++    // rules are GTK's own: a command with a true/false state is a check box, and
++    // an entry with a target value is a radio button, on when the state equals it.
++    _command(action, target) {
++        const none = { exists: false, enabled: false, ornament: 'none' };
++        const [group, name] = this._resolve(action);
++        if (!group)
++            return none;
++
++        try {
++            const [exists, enabled, parameterType, , , state] = group.query_action(name);
++            if (!exists)
++                return none;
++
++            let usable;
++            let ornament = 'none';
++            if (target) {
++                usable = parameterType !== null && target.is_of_type(parameterType);
++                if (state && state.get_type_string() === target.get_type_string())
++                    ornament = state.equal(target) ? 'dot' : 'none';
++            } else {
++                usable = parameterType === null;
++                if (state?.get_type_string() === 'b')
++                    ornament = state.get_boolean() ? 'check' : 'none';
++            }
++            return { exists: true, enabled: enabled && usable, ornament };
++        } catch (e) {
++            Logger.debug(`Could not read the command ${action}: ${e}`);
++            return none;
++        }
++    }
++
++    _activate(action, target) {
++        const [group, name] = this._resolve(action);
++        if (!group) {
++            Logger.debug(`Menu command "${action}" is gone; nothing activated.`);
++            return;
++        }
++
++        try {
++            group.activate_action(name, target);
++        } catch (e) {
++            Logger.error(`GTK menu activation failed for ${action}: ${e}`);
++        }
++    }
++
++    // A submenu can name a command that the program wants to hear from while
++    // the submenu is open; the program brings the entries up to date then.
++    _setOpenAt(path, open) {
++        const place = path.map(step => `${step.nth}:${step.label}`).join('\n');
++        const action = open ? this._submenuAt(path)?.action : this._opened.get(place);
++        if (!action)
++            return;
++
++        if (open)
++            this._opened.set(place, action);
++        else
++            this._opened.delete(place);
++        this._tell(action, open);
++    }
++
++    _tell(action, open) {
++        const [group, name] = this._resolve(action);
++        if (!group)
++            return;
++
++        try {
++            group.change_action_state(name, GLib.Variant.new_boolean(open));
++        } catch (e) {
++            Logger.debug(`Could not tell ${action} that its menu is ${open ? 'open' : 'closed'}: ${e}`);
++        }
++    }
++
++    // A submenu that has arrived empty may be filled only when it is about to show.
++    _askOnce(submenu, action) {
++        if (!action || this._asked.has(action))
++            return;
++
++        const entry = this._models.get(submenu);
++        if (!entry || (!entry.arrived && _now() - entry.askedAt < LOAD_WAIT_MS))
++            return;
++
++        this._asked.add(action);
++        this._tell(action, true);
++        this._tell(action, false);
++    }
++}
+diff --git a/menuManager.js b/menuManager.js
+index e75b289..a2358d2 100644
+--- a/menuManager.js
++++ b/menuManager.js
+@@ -58,6 +58,16 @@ function _getStaticMenus() {
+     ];
+ }
+ 
++// What a list of menu entries shows, without the callbacks. Two lists with
++// the same signature look the same on screen.
++function _entriesSignature(entries) {
++    try {
++        return JSON.stringify(entries ?? [], (_key, value) => typeof value === 'function' ? undefined : value);
++    } catch (_e) {
++        return null;
++    }
++}
++
+ const TopLevelMenuButton = GObject.registerClass(
+   class TopLevelMenuButton extends PanelMenu.Button {
+     _init(label, children, appInstance = null, menuManagerInstance = null) {
+@@ -88,11 +98,164 @@ const TopLevelMenuButton = GObject.registerClass(
+       }
+       this._menuOpenSignalId = 0;
+       this._menuOpenHandler = null;
+-      this._subMenuSignalIds = [];
++      this._menuCloseHandler = null;
++      this._menuSources = new Map();    // menu -> { source, signature, signals, markColumn }
++      this._reopening = false;
++      this._revealTimeoutId = 0;
+       this._destroyed = false;
+ 
++      this._buildScrollArea();
++      this._keepParentSubmenusOpen();
+       this._setMenuOpenHandler(null);
+-      this._buildSubMenu(children, this.menu);
++      this._setMenuSource(this.menu, children);
++    }
++
++    // A menu that is taller than the screen would lose its last entries. The
++    // stock answer is a scrollbar inside each submenu, which leaves a submenu
++    // of a long menu a few rows. Here the whole menu scrolls, and a submenu
++    // opens to its full height. The entries live in a section of their own
++    // inside the scroll view.
++    _buildScrollArea() {
++        const holder = new PopupMenu.PopupMenuSection();
++        this.menu.addMenuItem(holder);
++        this._entries = new PopupMenu.PopupMenuSection();
++        // Added as a menu item for the wiring between menu and section, then
++        // moved into the scroll view.
++        holder.addMenuItem(this._entries);
++        holder.box.remove_child(this._entries.actor);
++
++        // No scrollbar (it would lie over the key hints): the wheel and the
++        // arrow keys scroll, and the edge fades where the menu goes on.
++        this._scrollView = new St.ScrollView({
++            style_class: 'appmenu-menu-scroll vfade',
++            hscrollbar_policy: St.PolicyType.NEVER,
++            vscrollbar_policy: St.PolicyType.EXTERNAL,
++        });
++        if (this._scrollView.set_child)
++            this._scrollView.set_child(this._entries.actor);
++        else
++            this._scrollView.add_actor(this._entries.actor);
++        holder.box.add_child(this._scrollView);
++
++        // The recent-items entry asks the menu it is in for its neighbours and
++        // for the open state; the first are in the section, the second is the
++        // whole menu's.
++        const menu = this.menu;
++        const entries = this._entries;
++        this._entriesMenu = {
++            _getMenuItems: () => entries._getMenuItems(),
++            connect: (...args) => menu.connect(...args),
++            disconnect: id => menu.disconnect(id),
++            close: (...args) => menu.close(...args),
++            get isOpen() { return menu.isOpen; },
++        };
++    }
++
++    // Where the entries of a menu go: the section for the menu of the button,
++    // the menu itself for a submenu.
++    _holderOf(menu) {
++        return menu === this.menu ? this._entries : menu;
++    }
++
++    // Stock popup menus keep a single submenu open and close it when another
++    // one opens, also when the new one lies inside it: a submenu in a submenu
++    // would shut the one it is in. Close only what is not on the way down.
++    _keepParentSubmenusOpen() {
++        const top = this.menu;
++        const open = new Set();
++        const isInside = (menu, ancestor) => {
++            for (let parent = menu._parent; parent; parent = parent._parent) {
++                if (parent === ancestor)
++                    return true;
++            }
++            return false;
++        };
++
++        top._setOpenedSubMenu = submenu => {
++            if (submenu) {
++                for (const other of [...open]) {
++                    if (other !== submenu && !isInside(submenu, other))
++                        other.close(true);
++                }
++                open.add(submenu);
++            }
++            for (const other of [...open]) {
++                if (!other.isOpen)
++                    open.delete(other);
++            }
++            // A submenu goes with the one it is in.
++            for (const other of [...open]) {
++                if (other._parent !== this._entries && other._parent?.isOpen === false)
++                    other.close(false);
++            }
++        };
++    }
++
++    // Scrolls the menu so that an entry is in view, or everything from that
++    // entry down to the end of `last` (a submenu that has just opened).
++    _reveal(actor, last = actor) {
++        const adjustment = this._scrollView?.vadjustment ?? this._scrollView?.vscroll?.adjustment;
++        const content = this._entries?.actor;
++        if (!adjustment || !content || !actor || !last)
++            return;
++
++        const offset = from => {
++            let y = 0;
++            let parent = from;
++            for (; parent && parent !== content; parent = parent.get_parent())
++                y += parent.get_allocation_box().y1;
++            return parent ? y : null;
++        };
++        const top = offset(actor);
++        const lastTop = offset(last);
++        if (top === null || lastTop === null)
++            return;
++
++        const value = adjustment.value;
++        const pageSize = adjustment.page_size;
++        const bottom = lastTop + last.height;
++        let target = value;
++        if (top < value || bottom - top > pageSize)
++            target = top;
++        else if (bottom > value + pageSize)
++            target = bottom - pageSize;
++        target = Math.max(adjustment.lower, Math.min(target, adjustment.upper - pageSize));
++        if (Math.abs(target - value) < 1)
++            return;
++
++        if (adjustment.ease)
++            adjustment.ease(target, { duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
++        else
++            adjustment.value = target;
++    }
++
++    // A menu opens at its first entry, wherever it was left.
++    _scrollToTop() {
++        const adjustment = this._scrollView?.vadjustment ?? this._scrollView?.vscroll?.adjustment;
++        if (!adjustment)
++            return;
++
++        adjustment.remove_transition?.('value');
++        adjustment.value = adjustment.lower;
++    }
++
++    // An entry reached with the arrow keys. The pointer selects entries
++    // too, and the menu must not move under it.
++    _revealFocused(item) {
++        if (!item.hover)
++            this._reveal(item);
++    }
++
++    // A submenu takes a moment to unfold; bring it into view when it has.
++    _revealWhenOpen(item) {
++        if (this._revealTimeoutId)
++            GLib.source_remove(this._revealTimeoutId);
++        this._revealTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 280, () => {
++            this._revealTimeoutId = 0;
++            if (!this._destroyed && item.menu?.isOpen)
++                this._reveal(item, item.menu.actor);
++            return GLib.SOURCE_REMOVE;
++        });
+     }
+ 
+     _executeNativeAction(action, closeMenu = true) {
+@@ -181,18 +344,23 @@ const TopLevelMenuButton = GObject.registerClass(
+         }
+     }
+ 
+-    _setMenuOpenHandler(handler) {
++    _setMenuOpenHandler(handler, closeHandler = null) {
+         if (this._destroyed || !this.menu)
+             return;
+         this._menuOpenHandler = handler;
++        this._menuCloseHandler = closeHandler;
+         if (this._menuOpenSignalId) {
+             try { this.menu.disconnect(this._menuOpenSignalId); } catch (_e) {}
+             this._menuOpenSignalId = 0;
+         }
+ 
+         this._menuOpenSignalId = this.menu.connect('open-state-changed', (_menu, isOpen) => {
+-            if (isOpen && !this._destroyed)
++            if (this._destroyed)
++                return;
++            if (isOpen)
+                 this._menuOpenHandler?.();
++            else
++                this._menuCloseHandler?.();
+         });
+     }
+ 
+@@ -202,26 +370,123 @@ const TopLevelMenuButton = GObject.registerClass(
+             this._menuOpenSignalId = 0;
+         }
+ 
+-        this._subMenuSignalIds.forEach(({target, id}) => {
++        for (const state of this._menuSources.values())
++            this._disconnectEntrySignals(state);
++    }
++
++    _disconnectEntrySignals(state) {
++        state.signals.forEach(({target, id}) => {
+             try { target.disconnect(id); } catch (_e) {}
+         });
+-        this._subMenuSignalIds = [];
++        state.signals = [];
+     }
+ 
+-    rebuildMenu(children, openHandler = null) {
++    // children: the entries of the menu, or a function that lists them.
++    rebuildMenu(children, openHandler = null, closeHandler = null) {
+         if (this._destroyed || !this.menu)
+             return;
+ 
+-        this._disconnectMenuSignals();
++        this._setMenuOpenHandler(openHandler, closeHandler);
++        this._setMenuSource(this.menu, children);
++    }
++
++    // The app changed entries inside its menus: redo the menus that are open.
++    refreshOpenMenus() {
++        if (this._destroyed)
++            return;
++
++        // A menu that is redone takes its submenus with it.
++        for (const menu of [...this._menuSources.keys()]) {
++            if (this._menuSources.has(menu) && menu.isOpen)
++                this._fillMenu(menu);
++        }
++    }
++
++    // A menu gets its entries when it is about to open, top-level menus and
++    // submenus alike: the menu of a real application has hundreds of entries,
++    // most are never looked at, and making them all at every change of focus
++    // holds up the whole desktop.
++    _setMenuSource(menu, source) {
++        const state = this._menuSources.get(menu);
++        if (state) {
++            state.source = source;
++            if (menu.isOpen)
++                this._fillMenu(menu);
++            else
++                this._emptyMenu(menu);
++            return;
++        }
+ 
++        this._menuSources.set(menu, { source, signature: null, signals: [], markColumn: false });
++        // An empty menu refuses to open, so the entries go in just before.
++        const open = menu.open;
++        menu.open = animate => {
++            if (!menu.isOpen && !this._destroyed) {
++                this._fillMenu(menu);
++                if (menu === this.menu)
++                    this._scrollToTop();
++            }
++            if (!this._holderOf(menu).isEmpty())
++                open.call(menu, animate);
++        };
++        menu.connect('destroy', () => this._menuSources.delete(menu));
++    }
++
++    _fillMenu(menu) {
++        const state = this._menuSources.get(menu);
++        if (!state)
++            return;
++
++        let entries = [];
+         try {
+-            this.menu.removeAll();
+-        } catch (_e) {
+-            // Do not rebuild a popup whose actor was disposed during reload.
++            entries = (typeof state.source === 'function' ? state.source() : state.source) ?? [];
++        } catch (e) {
++            Logger.error(`Could not list the entries of a menu: ${e}`);
++        }
++
++        const signature = _entriesSignature(entries);
++        if (signature !== null && signature === state.signature)
+             return;
++
++        // A submenu that is open stays open when the entries around it change.
++        const holder = this._holderOf(menu);
++        const openLabels = menu.isOpen
++            ? holder._getMenuItems().filter(item => item.menu?.isOpen).map(item => item.label?.text)
++            : [];
++
++        this._emptyMenu(menu);
++        this._buildSubMenu(entries, menu);
++        state.signature = signature;
++
++        if (openLabels.length === 0)
++            return;
++        this._reopening = true;
++        try {
++            for (const item of holder._getMenuItems()) {
++                if (item.menu && openLabels.includes(item.label?.text))
++                    item.menu.open(false);
++            }
++        } finally {
++            this._reopening = false;
++        }
++    }
++
++    _emptyMenu(menu) {
++        const state = this._menuSources.get(menu);
++        if (!state)
++            return;
++
++        this._disconnectEntrySignals(state);
++        const holder = this._holderOf(menu);
++        if (holder.numMenuItems === 0)
++            return;
++
++        state.signature = null;
++        try {
++            holder.removeAll();
++        } catch (_e) {
++            // A popup whose actor was disposed during reload.
+         }
+-        this._setMenuOpenHandler(openHandler);
+-        this._buildSubMenu(children, this.menu);
+     }
+ 
+     destroy() {
+@@ -229,12 +494,29 @@ const TopLevelMenuButton = GObject.registerClass(
+             return;
+         this._destroyed = true;
+         this._menuOpenHandler = null;
++        this._menuCloseHandler = null;
++        if (this._revealTimeoutId) {
++            GLib.source_remove(this._revealTimeoutId);
++            this._revealTimeoutId = 0;
++        }
+         this._disconnectMenuSignals();
+         try { this.menu?.close(true); } catch (_e) {}
+         super.destroy();
+     }
+ 
+-        _buildSubMenu(menuItems, parentMenu) {
++        _buildSubMenu(menuItems, menu) {
++      const state = this._menuSources.get(menu);
++      const signals = state?.signals ?? [];
++      const parentMenu = this._holderOf(menu);
++      // Entries either all keep room for a check mark or none does, so that
++      // labels line up; an entry of a real menu says 'none' when it has no mark.
++      // A submenu keeps the room its parent keeps, or it would stand left of it.
++      const outer = this._menuSources.get(menu._parent === this._entries ? this.menu : menu._parent);
++      const markColumn = Boolean(outer?.markColumn && menu !== this.menu)
++          || menuItems.some(item => item.ornament === 'dot' || item.ornament === 'check');
++      if (state)
++          state.markColumn = markColumn;
++      const blankMark = markColumn ? PopupMenu.Ornament.NONE : PopupMenu.Ornament.HIDDEN;
+       for (let idx = 0; idx < menuItems.length; idx++) {
+         const item = menuItems[idx];
+         if (item.type === "separator") {
+@@ -246,21 +528,42 @@ const TopLevelMenuButton = GObject.registerClass(
+           parentMenu.addMenuItem(headerItem);
+         } else if (item.type === "submenu") {
+           const subMenu = new PopupMenu.PopupSubMenuMenuItem(item.label);
+-          if (typeof item.onOpen === 'function') {
+-              const sid = subMenu.menu.connect('open-state-changed', (_menu, isOpen) => {
+-                  if (isOpen)
+-                      item.onOpen();
+-              });
+-              this._subMenuSignalIds.push({ target: subMenu.menu, id: sid });
+-          }
+-          this._buildSubMenu(item.children, subMenu.menu);
++          subMenu.setOrnament(blankMark);
++          // The menu as a whole scrolls; the submenu shows all it has.
++          subMenu.menu._needsScrollbar = () => false;
++          const sid = subMenu.menu.connect('open-state-changed', (_menu, isOpen) => {
++              // Opened again after its menu was redone: the app was not
++              // told that it closed, so it is not told that it opened.
++              if (!isOpen) {
++                  item.onClose?.();
++              } else {
++                  if (!this._reopening)
++                      item.onOpen?.();
++                  this._revealWhenOpen(subMenu);
++              }
++          });
++          signals.push({ target: subMenu.menu, id: sid });
++          signals.push({ target: subMenu, id: subMenu.connect('key-focus-in', () => this._revealFocused(subMenu)) });
++          this._setMenuSource(subMenu.menu, item.children);
+           parentMenu.addMenuItem(subMenu);
+         } else if (item.type === "recent-submenu") {
+           const recentMenuManager = this._menuManagerInstance?._recentMenuManager ?? null;
+-          const recentSubmenu = new RecentItemsSubmenu(item.label, parentMenu, recentMenuManager);
++          const recentSubmenu = new RecentItemsSubmenu(item.label,
++              menu === this.menu ? this._entriesMenu : parentMenu, recentMenuManager);
+           parentMenu.addMenuItem(recentSubmenu);
+         } else {
+           const menuItem = new PopupMenu.PopupMenuItem(item.label);
++          if (item.shortcut) {
++            // Key hint at the right edge, as the app shows it in its own menu.
++            menuItem.add_child(new St.Label({
++              text: item.shortcut,
++              style_class: 'appmenu-shortcut',
++              opacity: 150,
++              x_expand: true,
++              x_align: Clutter.ActorAlign.END,
++              y_align: Clutter.ActorAlign.CENTER,
++            }));
++          }
+           if (item.sensitive === false)
+             menuItem.setSensitive(false);
+           if (item.ornament) {
+@@ -268,15 +571,16 @@ const TopLevelMenuButton = GObject.registerClass(
+               ? PopupMenu.Ornament.DOT
+               : item.ornament === 'check'
+                 ? PopupMenu.Ornament.CHECK
+-                : PopupMenu.Ornament.NONE;
++                : blankMark;
+             menuItem.setOrnament(ornament);
+           }
++          signals.push({ target: menuItem, id: menuItem.connect('key-focus-in', () => this._revealFocused(menuItem)) });
+           if (typeof item.activate === 'function') {
+             const aid = menuItem.connect("activate", () => { item.activate(); });
+-            this._subMenuSignalIds.push({ target: menuItem, id: aid });
++            signals.push({ target: menuItem, id: aid });
+           } else if (item.action) {
+             const aid = menuItem.connect("activate", () => { this._executeNativeAction(item.action, true); });
+-            this._subMenuSignalIds.push({ target: menuItem, id: aid });
++            signals.push({ target: menuItem, id: aid });
+           }
+           parentMenu.addMenuItem(menuItem);
+         }
+@@ -341,7 +645,12 @@ export class MenuManager {
+         // Auto-detected distro icon (computed once, used as fallback)
+         this._distroIcon = DEFAULT_ICON;
+         this._realMenuManager = new RealMenuManager(this._settings, () => {
+-            this.updateMenuForWindow(global.display.get_focus_window(), true);
++            // The menu of the shown window changed. While one of our menus is
++            // open the shell may report no focused window; keep the shown one.
++            this.updateMenuForWindow(
++                this._realMenuManager.currentWindow ?? global.display.get_focus_window(), true);
++        }, () => {
++            this._buttons.forEach(btn => btn.refreshOpenMenus());
+         });
+ 
+         // Cached settings values (updated via signals, not read per focus change)
+@@ -499,7 +808,8 @@ export class MenuManager {
+         if (window) {
+             let windowType = window.get_window_type();
+ 
+-            if (windowType === 0) {
++            // Normal windows and dialogs (3, 4): a dialog belongs to its app too.
++            if (windowType === 0 || windowType === 3 || windowType === 4) {
+                 detectedApp = this._windowTracker.get_window_app(window);
+ 
+                 // Fast-path: skip blacklist entirely if list is empty
+@@ -680,7 +990,7 @@ export class MenuManager {
+ 
+             btn._appInstance = detectedApp;
+             btn.updateLabel(data.label);
+-            btn.rebuildMenu(data.children, data.onOpen ?? null);
++            btn.rebuildMenu(data.children, data.onOpen ?? null, data.onClose ?? null);
+         }
+ 
+         // Destroy excess buttons (shouldn't happen, but defensive)
+diff --git a/menuRegistrar.js b/menuRegistrar.js
+new file mode 100644
+index 0000000..e426176
+--- /dev/null
++++ b/menuRegistrar.js
+@@ -0,0 +1,295 @@
++// In-shell registrar for application menus.
++//
++// Apps that can show their menu outside the window (Electron, Chromium, Firefox
++// and Qt, when they run as X11 clients) look for com.canonical.AppMenu.Registrar
++// on the session bus and register one com.canonical.dbusmenu object per window,
++// under the X11 window id. Nothing in a stock GNOME session owns that name, so
++// AppMenu owns it while real menus are enabled, and keeps a loaded dbusmenu
++// client per registered window so that a menu is ready when its window gets
++// the focus.
++
++import Gio from 'gi://Gio';
++import GLib from 'gi://GLib';
++import * as Logger from './logger.js';
++
++const BUS_NAME = 'com.canonical.AppMenu.Registrar';
++const OBJECT_PATH = '/com/canonical/AppMenu/Registrar';
++const DBUSMENU_INTERFACE = 'com.canonical.dbusmenu';
++const MAX_WINDOWS = 512;
++const FILL_WAIT_MS = 400;
++
++const INTERFACE_XML = `
++<node>
++  <interface name="com.canonical.AppMenu.Registrar">
++    <method name="RegisterWindow">
++      <arg type="u" name="windowId" direction="in"/>
++      <arg type="o" name="menuObjectPath" direction="in"/>
++    </method>
++    <method name="UnregisterWindow">
++      <arg type="u" name="windowId" direction="in"/>
++    </method>
++    <method name="GetMenuForWindow">
++      <arg type="u" name="windowId" direction="in"/>
++      <arg type="s" name="service" direction="out"/>
++      <arg type="o" name="menuObjectPath" direction="out"/>
++    </method>
++    <method name="GetMenus">
++      <arg type="a(uso)" name="menus" direction="out"/>
++    </method>
++    <signal name="WindowRegistered">
++      <arg type="u" name="windowId"/>
++      <arg type="s" name="service"/>
++      <arg type="o" name="menuObjectPath"/>
++    </signal>
++    <signal name="WindowUnregistered">
++      <arg type="u" name="windowId"/>
++    </signal>
++  </interface>
++</node>`;
++
++class RegisteredMenu {
++    constructor(Dbusmenu, windowId, service, path) {
++        this.windowId = windowId;
++        this.service = service;
++        this.path = path;
++        this._asked = new Map();    // item id -> when its submenu was asked for, in ms
++        this.client = new Dbusmenu.Client({ dbus_name: service, dbus_object: path });
++        this._signalIds = [
++            this.client.connect(Dbusmenu.CLIENT_SIGNAL_ROOT_CHANGED, () => {
++                this._asked.clear();
++                this._fillSubmenus();
++            }),
++            this.client.connect(Dbusmenu.CLIENT_SIGNAL_LAYOUT_UPDATED, () => this._fillSubmenus()),
++        ];
++    }
++
++    // Electron builds a submenu only once it is told that the submenu is about
++    // to show. Ask for every empty submenu once, so that menus open complete.
++    _fillSubmenus() {
++        const root = this.client?.get_root();
++        if (!root)
++            return;
++
++        const visit = item => {
++            const children = item.get_children();
++            const id = item.get_id();
++            if (children.length === 0
++                && item.property_get('children-display') === 'submenu'
++                && !this._asked.has(id)) {
++                this._asked.set(id, GLib.get_monotonic_time() / 1000);
++                this.aboutToShow(id);
++            }
++            children.forEach(visit);
++        };
++        root.get_children().forEach(visit);
++    }
++
++    // True while a submenu that was asked for a moment ago is still empty.
++    get filling() {
++        const root = this.client?.get_root();
++        if (!root)
++            return false;
++
++        const now = GLib.get_monotonic_time() / 1000;
++        const waiting = item => {
++            const children = item.get_children();
++            if (children.length > 0)
++                return children.some(waiting);
++            const askedAt = this._asked.get(item.get_id());
++            return askedAt !== undefined && now - askedAt < FILL_WAIT_MS;
++        };
++        return root.get_children().some(waiting);
++    }
++
++    aboutToShow(id) {
++        Gio.DBus.session.call(
++            this.service, this.path, DBUSMENU_INTERFACE, 'AboutToShow',
++            new GLib.Variant('(i)', [id]), null, Gio.DBusCallFlags.NO_AUTO_START, 2000, null,
++            (connection, result) => {
++                try {
++                    connection.call_finish(result);
++                } catch (e) {
++                    Logger.debug(`AboutToShow(${id}) failed for ${this.service}${this.path}: ${e.message}`);
++                }
++            });
++    }
++
++    destroy() {
++        for (const id of this._signalIds) {
++            try { this.client.disconnect(id); } catch (_e) { /* ignore */ }
++        }
++        this._signalIds = [];
++        this.client = null;
++    }
++}
++
++export class MenuRegistrar {
++    // onChanged(windowId) is called when a window gains or loses its menu.
++    constructor(Dbusmenu, onChanged) {
++        this._Dbusmenu = Dbusmenu;
++        this._onChanged = onChanged;
++        this._menus = new Map();        // window id -> RegisteredMenu
++        this._watches = new Map();      // bus name of an app -> watch id
++        this._exported = null;
++        this._ownerId = 0;
++        this._isOwner = false;
++    }
++
++    // False while another program is the registrar; that one is asked instead.
++    get isOwner() {
++        return this._isOwner;
++    }
++
++    start() {
++        if (this._ownerId || !this._Dbusmenu)
++            return;
++
++        try {
++            this._exported = Gio.DBusExportedObject.wrapJSObject(INTERFACE_XML, this);
++            this._exported.export(Gio.DBus.session, OBJECT_PATH);
++        } catch (e) {
++            Logger.error(`Could not export the menu registrar: ${e}`);
++            this._exported = null;
++            return;
++        }
++
++        // Queued, not forced: an existing registrar keeps the name.
++        this._ownerId = Gio.bus_own_name_on_connection(
++            Gio.DBus.session, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
++            () => {
++                this._isOwner = true;
++                Logger.debug('Menu registrar: name acquired.');
++            },
++            () => {
++                this._isOwner = false;
++                Logger.debug('Menu registrar: name held by another program.');
++            });
++    }
++
++    stop() {
++        if (this._ownerId) {
++            Gio.bus_unown_name(this._ownerId);
++            this._ownerId = 0;
++        }
++        this._isOwner = false;
++
++        try { this._exported?.unexport(); } catch (_e) { /* ignore */ }
++        this._exported = null;
++
++        for (const menu of this._menus.values())
++            menu.destroy();
++        this._menus.clear();
++        for (const watchId of this._watches.values())
++            Gio.bus_unwatch_name(watchId);
++        this._watches.clear();
++    }
++
++    destroy() {
++        this.stop();
++        this._onChanged = null;
++    }
++
++    lookup(windowId) {
++        return this._menus.get(windowId) ?? null;
++    }
++
++    // ── D-Bus methods ─────────────────────────────────────────────────
++    // The Async forms receive the invocation, which names the calling app.
++
++    RegisterWindowAsync([windowId, path], invocation) {
++        const service = invocation.get_sender();
++        invocation.return_value(null);
++        this._add(windowId, service, path);
++    }
++
++    UnregisterWindowAsync([windowId], invocation) {
++        const service = invocation.get_sender();
++        invocation.return_value(null);
++        if (this._menus.get(windowId)?.service === service)
++            this._remove(windowId);
++    }
++
++    GetMenuForWindow(windowId) {
++        const menu = this._menus.get(windowId);
++        return new GLib.Variant('(so)', menu ? [menu.service, menu.path] : ['', '/']);
++    }
++
++    GetMenus() {
++        return new GLib.Variant('(a(uso))',
++            [[...this._menus.values()].map(menu => [menu.windowId, menu.service, menu.path])]);
++    }
++
++    // ── bookkeeping ───────────────────────────────────────────────────
++
++    _add(windowId, service, path) {
++        if (!windowId || !service || !path)
++            return;
++
++        // An app registers again when it replaces its menu.
++        this._menus.get(windowId)?.destroy();
++        this._menus.delete(windowId);
++
++        if (this._menus.size >= MAX_WINDOWS) {
++            Logger.error(`Menu registrar is full; ignoring window ${windowId} of ${service}.`);
++            return;
++        }
++
++        try {
++            this._menus.set(windowId, new RegisteredMenu(this._Dbusmenu, windowId, service, path));
++        } catch (e) {
++            Logger.error(`Could not load the menu ${service}${path}: ${e}`);
++            return;
++        }
++
++        if (!this._watches.has(service)) {
++            this._watches.set(service, Gio.bus_watch_name_on_connection(
++                Gio.DBus.session, service, Gio.BusNameWatcherFlags.NONE,
++                null, () => this._removeService(service)));
++        }
++
++        Logger.debug(`Menu registered for window 0x${windowId.toString(16)}: ${service}${path}`);
++        this._emit('WindowRegistered', new GLib.Variant('(uso)', [windowId, service, path]));
++        this._notify(windowId);
++    }
++
++    _remove(windowId) {
++        const menu = this._menus.get(windowId);
++        if (!menu)
++            return;
++
++        menu.destroy();
++        this._menus.delete(windowId);
++        Logger.debug(`Menu unregistered for window 0x${windowId.toString(16)}.`);
++        this._emit('WindowUnregistered', new GLib.Variant('(u)', [windowId]));
++        this._notify(windowId);
++    }
++
++    // The app left the bus without unregistering its windows.
++    _removeService(service) {
++        const watchId = this._watches.get(service);
++        if (watchId) {
++            Gio.bus_unwatch_name(watchId);
++            this._watches.delete(service);
++        }
++        for (const menu of [...this._menus.values()]) {
++            if (menu.service === service)
++                this._remove(menu.windowId);
++        }
++    }
++
++    _emit(signal, parameters) {
++        try {
++            this._exported?.emit_signal(signal, parameters);
++        } catch (e) {
++            Logger.debug(`Could not emit ${signal}: ${e}`);
++        }
++    }
++
++    _notify(windowId) {
++        try {
++            this._onChanged?.(windowId);
++        } catch (e) {
++            Logger.error(`Menu registrar callback failed: ${e}`);
++        }
++    }
++}
+diff --git a/menuText.js b/menuText.js
+new file mode 100644
+index 0000000..4738448
+--- /dev/null
++++ b/menuText.js
+@@ -0,0 +1,38 @@
++// Text helpers shared by the readers of application menus.
++
++const KEY_NAMES = new Map([
++    ['Control', 'Ctrl'], ['Primary', 'Ctrl'], ['Return', 'Enter'], ['Escape', 'Esc'], ['Delete', 'Del'],
++    ['space', 'Space'], ['plus', '+'], ['minus', '-'], ['equal', '='], ['comma', ','],
++    ['period', '.'], ['slash', '/'], ['backslash', '\\'], ['grave', '`'],
++    ['semicolon', ';'], ['apostrophe', "'"], ['bracketleft', '['], ['bracketright', ']'],
++    ['Page_Up', 'PgUp'], ['Page_Down', 'PgDn'], ['BackSpace', 'Backspace'],
++    ['Mod1', 'Alt'], ['Mod4', 'Super'],
++]);
++
++// A menu label without its mnemonic mark: "_File" is File, "__" is a real underscore.
++export function normalizeLabel(label) {
++    return String(label ?? '')
++        .replace(/_(_?)/g, '$1')
++        .replace(/\.\.\.$/g, '…')
++        .replace(/\s+/g, ' ')
++        .trim();
++}
++
++// A key or modifier name as apps send it ("Control", "n", "Page_Up"), for display.
++export function keyLabel(key) {
++    const name = String(key ?? '');
++    return KEY_NAMES.get(name) ?? (name.length === 1 ? name.toUpperCase() : name.replace(/^KP_/, 'Num '));
++}
++
++// A GTK accelerator ("<Primary><Shift>n") as the app shows it: Ctrl+Shift+N.
++export function acceleratorLabel(accel) {
++    let rest = String(accel ?? '');
++    const keys = [];
++    for (let match = /^<([^<>]+)>/.exec(rest); match; match = /^<([^<>]+)>/.exec(rest)) {
++        keys.push(match[1]);
++        rest = rest.slice(match[0].length);
++    }
++    if (!rest)
++        return '';
++    return [...keys, rest].map(keyLabel).join('+');
++}
+diff --git a/realMenuManager.js b/realMenuManager.js
+index ce505f4..269bce2 100644
+--- a/realMenuManager.js
++++ b/realMenuManager.js
+@@ -1,7 +1,11 @@
+ import Gio from 'gi://Gio';
+ import GLib from 'gi://GLib';
++import Meta from 'gi://Meta';
+ import * as Logger from './logger.js';
+ import { _ } from './i18n.js';
++import { MenuRegistrar } from './menuRegistrar.js';
++import { GtkMenuBar } from './gtkMenuBar.js';
++import { normalizeLabel as _normalizeLabel, keyLabel } from './menuText.js';
+ 
+ // dbusmenu is optional. Fedora minimal installations and GTK-action-only apps
+ // must still be able to load AppMenu without the typelib installed.
+@@ -18,6 +22,13 @@ const REGISTRAR_BUS_NAME = 'com.canonical.AppMenu.Registrar';
+ const REGISTRAR_OBJECT_PATH = '/com/canonical/AppMenu/Registrar';
+ const REGISTRAR_INTERFACE = 'com.canonical.AppMenu.Registrar';
+ const GTK_ACTIONS_INTERFACE = 'org.gtk.Actions';
++const DBUSMENU_INTERFACE = 'com.canonical.dbusmenu';
++// An app's menu changes arrive in bursts; pass them on once, a moment later.
++const CHANGE_DELAY_MS = 40;
++const CHANGE_MAX_TRIES = 12;
++// Windows whose GTK menu bar stays loaded, so that it is there at once when
++// the window gets the focus again.
++const MAX_GTK_MENU_BARS = 24;
+ 
+ Gio._promisify(Gio.DBusConnection.prototype, 'call', 'call_finish');
+ 
+@@ -197,19 +208,83 @@ function _humanizeActionName(name) {
+ }
+ 
+ // ── dbusmenu helpers ──────────────────────────────────────────────────────
+-function _normalizeLabel(label) {
+-    return String(label ?? '')
+-        .replace(/_/g, '')
+-        .replace(/\.\.\.$/g, '…')
+-        .replace(/\s+/g, ' ')
+-        .trim();
+-}
+-
+ function _isVisible(item) {
+     return !item.property_exist(Dbusmenu.MENUITEM_PROP_VISIBLE)
+         || item.property_get_bool(Dbusmenu.MENUITEM_PROP_VISIBLE);
+ }
+ 
++function _visibleChildren(item) {
++    return item.get_children().filter(child => _isVisible(child));
++}
++
++// X11 clients register their menu under the X11 window id, which mutter keeps
++// in the window description ("0x1a00004"). A Wayland window has no such id.
++function _x11WindowId(window) {
++    try {
++        if (window?.get_client_type?.() !== Meta.WindowClientType.X11)
++            return 0;
++        const match = /0x[0-9a-f]+/i.exec(window.get_description() ?? '');
++        return match ? parseInt(match[0], 16) : 0;
++    } catch (_e) {
++        return 0;
++    }
++}
++
++// The windows whose menu serves a window: itself, and for a dialog the window
++// it belongs to, since a dialog has no menu of its own. Not for a modal
++// dialog: the app takes no commands while one is open, though some (LibreOffice)
++// leave every entry of the menu enabled.
++function _menuWindows(window) {
++    const windows = [];
++    try {
++        for (let w = window, depth = 0; w && depth < 5; depth++) {
++            windows.push(w);
++            if (w.get_window_type() === Meta.WindowType.MODAL_DIALOG)
++                break;
++            w = w.get_transient_for?.() ?? null;
++        }
++    } catch (_e) {
++        // A window that is going away.
++    }
++    return windows;
++}
++
++function _menuWindowIds(window) {
++    return _menuWindows(window).map(_x11WindowId).filter(Boolean);
++}
++
++// A GTK program names its menu bar on the window.
++function _gtkMenuBarWindow(window) {
++    return _menuWindows(window).find(w =>
++        w.get_gtk_menubar_object_path?.() && w.get_gtk_unique_bus_name?.()) ?? null;
++}
++
++// The "shortcut" property lists key combinations, each a list of key names:
++// [['Control', 'Shift', 'n']]. Shown next to the item, like in the app.
++function _shortcutText(item) {
++    try {
++        const keys = item.property_get_variant(Dbusmenu.MENUITEM_PROP_SHORTCUT)?.deepUnpack()?.[0];
++        if (!Array.isArray(keys) || keys.length === 0)
++            return '';
++        return keys.map(keyLabel).join('+');
++    } catch (_e) {
++        return '';
++    }
++}
++
++// Electron cannot give a two-step shortcut as a shortcut, so VS Code writes it
++// into the label: "Open Folder... [Ctrl+K Ctrl+O]". Split it off again.
++function _splitLabelHint(rawLabel) {
++    const match = /^(.*\S)\s+\[([^\[\]]+)\]$/.exec(String(rawLabel ?? ''));
++    return match ? [match[1], match[2]] : [rawLabel, ''];
++}
++
++// What a menu model shows, without the callbacks. Two models with the same
++// signature look the same on screen.
++function _modelSignature(model) {
++    return JSON.stringify(model ?? null, (_key, value) => typeof value === 'function' ? undefined : value);
++}
++
+ function _unpackGtkActionDetails(details) {
+     if (Array.isArray(details)) {
+         return {
+@@ -321,9 +396,12 @@ async function _probeGtkActions(busName, objectPath, cancellable) {
+ 
+ // ── RealMenuManager ──────────────────────────────────────────────────────
+ export class RealMenuManager {
+-    constructor(settings, onChanged) {
++    // onChanged() is called when the bar has to show other menus, and
++    // onContentChanged() when only entries inside the menus changed.
++    constructor(settings, onChanged, onContentChanged = null) {
+         this._settings = settings;
+         this._onChanged = onChanged;
++        this._onContentChanged = onContentChanged;
+         this._client = null;
+         this._clientSignalIds = [];
+         this._currentKey = null;
+@@ -338,6 +416,30 @@ export class RealMenuManager {
+         this._requestCancellable = null;
+         this._registrarFailed = false;
+         this._isWayland = (GLib.getenv('XDG_SESSION_TYPE') ?? '').toLowerCase() === 'wayland';
++        this._currentDetectedApp = null;
++        this._currentWmClass = '';
++        this._shownSignature = null;
++        this._changeTimeoutId = 0;
++        this._changeTries = 0;
++        this._gtkMenuBars = new Map();      // window -> { window, bar, unmanagedId }
++        this._watchedWindow = null;
++        this._watchedWindowIds = [];
++        this._registrar = new MenuRegistrar(Dbusmenu, windowId => this._onRegistrationChanged(windowId));
++        this._syncRegistrar();
++    }
++
++    // The window whose menu is shown. While one of the menus is open the shell
++    // may report no focused window, so updates should go to this one.
++    get currentWindow() {
++        return this._currentWindow;
++    }
++
++    // Be the registrar only while real menus are wanted.
++    _syncRegistrar() {
++        if (this.enabled)
++            this._registrar.start();
++        else
++            this._registrar.stop();
+     }
+ 
+     get enabled() {
+@@ -350,22 +452,30 @@ export class RealMenuManager {
+ 
+     invalidate() {
+         this._cancelRequest();
++        this._unwatchWindow();
+         this._currentWindow = null;
+         this._cachedActions = null;
+         this._cachedWinActions = null;
+         this._registrarFailed = false;
+         this._setBackend(null, null);
++        this._dropGtkMenuBars();
++        this._syncRegistrar();
+     }
+ 
+     destroy() {
+         this._cancelRequest();
++        this._unwatchWindow();
+         this._currentWindow = null;
+         this._cachedActions = null;
+         this._cachedWinActions = null;
+         this._registrarFailed = false;
+         this._setBackend(null, null);
++        this._dropGtkMenuBars();
++        this._registrar.destroy();
++        this._currentDetectedApp = null;
+         this._settings = null;
+         this._onChanged = null;
++        this._onContentChanged = null;
+     }
+ 
+     updateForWindow(window, appName = '', detectedApp = null, wmClass = '') {
+@@ -373,6 +483,7 @@ export class RealMenuManager {
+ 
+         if (!this.enabled || !window) {
+             this._cancelRequest();
++            this._unwatchWindow();
+             this._currentWindow = null;
+             this._cachedActions = null;
+             this._setBackend(null, null);
+@@ -399,6 +510,8 @@ export class RealMenuManager {
+     _startLookup(window, detectedApp, wmClass) {
+         this._cancelRequest();
+         this._currentWindow = window;
++        this._currentDetectedApp = detectedApp;
++        this._currentWmClass = wmClass;
+         this._cachedActions = null;
+         this._cachedWinActions = null;
+         this._setBackend(null, null);
+@@ -407,28 +520,77 @@ export class RealMenuManager {
+         this._requestCancellable = new Gio.Cancellable();
+         const cancellable = this._requestCancellable;
+ 
+-        if (!this._registrarFailed)
+-            this._requestRegistration(window, generation, cancellable);
++        this._watchWindow(window);
++        this._requestRegistration(window, generation, cancellable);
++        if (this._backendType !== 'dbusmenu')
++            this._useGtkMenuBar(window);
+         this._requestGtkActions(detectedApp, wmClass, generation, cancellable);
+     }
+ 
++    // A window names its GTK menu bar a moment after it appears, which can be
++    // after it got the focus.
++    _watchWindow(window) {
++        this._unwatchWindow();
++        try {
++            this._watchedWindowIds = ['notify::gtk-menubar-object-path', 'notify::gtk-unique-bus-name']
++                .map(signal => window.connect(signal, () => this._onWindowMenuBarChanged(window)));
++            this._watchedWindow = window;
++        } catch (_e) {
++            this._watchedWindowIds = [];
++        }
++    }
++
++    _unwatchWindow() {
++        for (const id of this._watchedWindowIds) {
++            try { this._watchedWindow.disconnect(id); } catch (_e) { /* ignore */ }
++        }
++        this._watchedWindowIds = [];
++        this._watchedWindow = null;
++    }
++
++    _onWindowMenuBarChanged(window) {
++        if (window !== this._currentWindow || !this.enabled)
++            return;
++
++        this._startLookup(window, this._currentDetectedApp, this._currentWmClass);
++        this._emitChanged();
++    }
++
++    // A menu arrived or left after its window got the focus: apps register a
++    // moment after they show the window, and again when they replace the menu.
++    _onRegistrationChanged(windowId) {
++        const window = this._currentWindow;
++        if (!window || !this.enabled || !_menuWindowIds(window).includes(windowId))
++            return;
++
++        this._startLookup(window, this._currentDetectedApp, this._currentWmClass);
++        this._emitChanged();
++    }
++
+     async _requestRegistration(window, generation, cancellable) {
+         if (!Dbusmenu)
+             return;
+ 
+-        let windowId = 0;
+-        try {
+-            windowId = window?.get_id?.() ?? 0;
+-        } catch (_e) {
++        const windowIds = _menuWindowIds(window);
++        if (windowIds.length === 0)
+             return;
++
++        // Our own registrar answers from memory, with the menu already loaded.
++        for (const id of windowIds) {
++            const menu = this._registrar.lookup(id);
++            if (menu) {
++                this._setBackend('dbusmenu', { service: menu.service, path: menu.path, menu });
++                return;
++            }
+         }
+-        if (!windowId)
++        if (this._registrar.isOwner)
+             return;
+ 
++        // Another program is the registrar: ask it.
+         try {
+             const result = await Gio.DBus.session.call(
+                 REGISTRAR_BUS_NAME, REGISTRAR_OBJECT_PATH, REGISTRAR_INTERFACE,
+-                'GetMenuForWindow', new GLib.Variant('(u)', [windowId]),
++                'GetMenuForWindow', new GLib.Variant('(u)', [windowIds[0]]),
+                 new GLib.VariantType('(so)'), Gio.DBusCallFlags.NONE, 1000, cancellable
+             );
+             if (!this._isCurrentRequest(generation, window))
+@@ -441,8 +603,7 @@ export class RealMenuManager {
+             this._setBackend('dbusmenu', { service, path });
+             this._emitChanged();
+         } catch (_e) {
+-            if (this._isWayland && this._isCurrentRequest(generation, window))
+-                this._registrarFailed = true;
++            // No registrar, or no menu for this window.
+         }
+     }
+ 
+@@ -460,7 +621,11 @@ export class RealMenuManager {
+             return;
+ 
+         const context = { busName, objectPath, appId };
+-        this._setBackend('gtk-actions', context);
++        // Next to a GTK menu bar the actions only stand in while that is empty.
++        if (this._backendType === 'gtk-menus')
++            this._currentGtkContext = context;
++        else
++            this._setBackend('gtk-actions', context);
+         this._cachedActions = actions;
+ 
+         const winActions = await _probeGtkActions(busName, `${objectPath}/window/1`, cancellable);
+@@ -474,13 +639,115 @@ export class RealMenuManager {
+     }
+ 
+     buildCurrentMenuModel(appName = '') {
+-        if (this._backendType === 'dbusmenu')
+-            return this._buildDbusMenuModel(appName);
+-        if (this._backendType === 'gtk-actions')
++        if (this._backendType === 'dbusmenu' || this._backendType === 'gtk-menus') {
++            const model = this._buildExportedMenuModel(appName);
++            this._shownSignature = _modelSignature(model);
++            if (model || this._backendType === 'dbusmenu')
++                return model;
++        }
++        if (this._backendType === 'gtk-actions' || this._backendType === 'gtk-menus')
+             return this._buildGtkActionMenuModel();
+         return null;
+     }
+ 
++    // The menu as the app itself publishes it.
++    _buildExportedMenuModel(appName = '') {
++        return this._backendType === 'gtk-menus'
++            ? this._buildGtkMenuBarModel(appName)
++            : this._buildDbusMenuModel(appName);
++    }
++
++    // ── GTK menu bar backend ──────────────────────────────────────────
++
++    _useGtkMenuBar(window) {
++        const owner = _gtkMenuBarWindow(window);
++        const entry = owner ? this._gtkMenuBarFor(owner) : null;
++        if (entry)
++            this._setBackend('gtk-menus', entry);
++    }
++
++    // One reader per window, kept while the window lives.
++    _gtkMenuBarFor(window) {
++        const where = {
++            busName: window.get_gtk_unique_bus_name(),
++            menubarPath: window.get_gtk_menubar_object_path(),
++            windowPath: window.get_gtk_window_object_path(),
++            applicationPath: window.get_gtk_application_object_path(),
++        };
++
++        let entry = this._gtkMenuBars.get(window);
++        if (entry && (entry.bar.busName !== where.busName || entry.bar.menubarPath !== where.menubarPath)) {
++            this._dropGtkMenuBar(window);
++            entry = null;
++        }
++        // The most recently used one goes last.
++        this._gtkMenuBars.delete(window);
++
++        if (!entry) {
++            try {
++                entry = { window, bar: null, unmanagedId: 0 };
++                entry.bar = new GtkMenuBar(where, () => this._onGtkMenuBarChanged(entry));
++                entry.unmanagedId = window.connect('unmanaged', () => this._dropGtkMenuBar(window));
++            } catch (e) {
++                Logger.error(`Could not read the GTK menu bar ${where.busName}${where.menubarPath}: ${e}`);
++                entry?.bar?.destroy();
++                return null;
++            }
++        }
++        this._gtkMenuBars.set(window, entry);
++
++        while (this._gtkMenuBars.size > MAX_GTK_MENU_BARS)
++            this._dropGtkMenuBar(this._gtkMenuBars.keys().next().value);
++        return entry;
++    }
++
++    _dropGtkMenuBar(window) {
++        const entry = this._gtkMenuBars.get(window);
++        if (!entry)
++            return;
++
++        this._gtkMenuBars.delete(window);
++        if (this._currentRegistration === entry)
++            this._setBackend(null, null);
++        try { window.disconnect(entry.unmanagedId); } catch (_e) { /* ignore */ }
++        entry.bar.destroy();
++    }
++
++    _dropGtkMenuBars() {
++        for (const window of [...this._gtkMenuBars.keys()])
++            this._dropGtkMenuBar(window);
++    }
++
++    _onGtkMenuBarChanged(entry) {
++        if (this._currentRegistration === entry)
++            this._onClientChanged();
++    }
++
++    _buildGtkMenuBarModel(appName = '') {
++        const entry = this._currentRegistration;
++        if (!entry?.bar)
++            return null;
++
++        const menus = entry.bar.buildMenus();
++        if (menus.length === 0)
++            return null;
++
++        let appMenuChildren = null;
++        const topLevelMenus = [];
++        for (const menu of menus) {
++            if (!appMenuChildren && _isAppMenuLabel(menu.label, appName))
++                appMenuChildren = menu.children();
++            else
++                topLevelMenus.push(menu);
++        }
++
++        return {
++            registrationKey: this._currentKey,
++            appMenuChildren,
++            topLevelMenus,
++        };
++    }
++
+     // ── dbusmenu (registrar) backend ──────────────────────────────────
+ 
+     _buildDbusMenuModel(appName = '') {
+@@ -491,9 +758,8 @@ export class RealMenuManager {
+         if (!root)
+             return null;
+ 
+-        const descriptors = root.get_children()
+-            .filter(item => _isVisible(item))
+-            .map(item => this._buildTopLevelDescriptor(item))
++        const descriptors = _visibleChildren(root)
++            .map((item, index) => this._buildTopLevelDescriptor(item, [index]))
+             .filter(Boolean);
+ 
+         if (descriptors.length === 0)
+@@ -503,16 +769,11 @@ export class RealMenuManager {
+         const topLevelMenus = [];
+ 
+         for (const descriptor of descriptors) {
+-            if (!appMenuChildren && _isAppMenuLabel(descriptor.label, appName)) {
+-                appMenuChildren = descriptor.children;
+-                continue;
+-            }
+-
+-            topLevelMenus.push({
+-                label: descriptor.label,
+-                children: descriptor.children,
+-                onOpen: descriptor.onOpen,
+-            });
++            // The app menu is merged with ours, so its entries are listed now.
++            if (!appMenuChildren && _isAppMenuLabel(descriptor.label, appName))
++                appMenuChildren = descriptor.children();
++            else
++                topLevelMenus.push(descriptor);
+         }
+ 
+         return {
+@@ -603,6 +864,7 @@ export class RealMenuManager {
+ 
+         this._backendType = kind;
+         this._currentRegistration = registration;
++        this._shownSignature = null;
+         if (!kind || !registration) {
+             this._currentKey = null;
+             this._currentGtkContext = null;
+@@ -615,6 +877,11 @@ export class RealMenuManager {
+             return;
+         }
+ 
++        if (kind === 'gtk-menus') {
++            this._currentKey = `gtk-menus:${registration.bar.busName}|${registration.bar.menubarPath}`;
++            return;
++        }
++
+         if (kind === 'gtk-actions') {
+             this._currentKey = `gtk:${registration.busName}|${registration.objectPath}`;
+             this._currentGtkContext = registration;
+@@ -622,6 +889,10 @@ export class RealMenuManager {
+     }
+ 
+     _disposeCurrentBackend() {
++        if (this._changeTimeoutId) {
++            GLib.source_remove(this._changeTimeoutId);
++            this._changeTimeoutId = 0;
++        }
+         if (this._client) {
+             this._clientSignalIds.forEach(id => {
+                 try { this._client.disconnect(id); } catch (_e) { /* ignore */ }
+@@ -634,14 +905,15 @@ export class RealMenuManager {
+ 
+     _setDbusmenuClient(registration) {
+         try {
+-            this._client = new Dbusmenu.Client({
++            // A menu from our own registrar comes with its client, already loaded.
++            this._client = registration.menu?.client ?? new Dbusmenu.Client({
+                 dbus_name: registration.service,
+                 dbus_object: registration.path,
+             });
+ 
+             this._clientSignalIds = [
+-                this._client.connect(Dbusmenu.CLIENT_SIGNAL_ROOT_CHANGED, () => this._emitChanged()),
+-                this._client.connect(Dbusmenu.CLIENT_SIGNAL_LAYOUT_UPDATED, () => this._emitChanged()),
++                this._client.connect(Dbusmenu.CLIENT_SIGNAL_ROOT_CHANGED, () => this._onClientChanged()),
++                this._client.connect(Dbusmenu.CLIENT_SIGNAL_LAYOUT_UPDATED, () => this._onClientChanged()),
+             ];
+         } catch (e) {
+             Logger.error(`Failed to create Dbusmenu client for ${registration.service}${registration.path}: ${e}`);
+@@ -704,75 +976,160 @@ export class RealMenuManager {
+         }
+     }
+ 
+-    // ── dbusmenu tree builders ─────────────────────────────────────────
++    _emitContentChanged() {
++        try {
++            this._onContentChanged?.();
++        } catch (e) {
++            Logger.error(`Real menu content callback failed: ${e}`);
++        }
++    }
+ 
+-    _buildTopLevelDescriptor(item) {
+-        if (!_isVisible(item))
+-            return null;
++    // The app changed its menu, or says so: Electron resends an unchanged
++    // submenu each time it is about to show, and LibreOffice changes entries
++    // while one types. So wait a moment, let submenus that were asked for
++    // arrive, and then redo the bar only if other menus have to show; changes
++    // inside the menus matter only to a menu that is open.
++    _onClientChanged() {
++        if (this._changeTimeoutId)
++            return;
+ 
+-        const label = _normalizeLabel(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL));
++        this._changeTries = 0;
++        this._changeTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CHANGE_DELAY_MS, () => {
++            if (this._currentRegistration?.menu?.filling && ++this._changeTries < CHANGE_MAX_TRIES)
++                return GLib.SOURCE_CONTINUE;
++
++            this._changeTimeoutId = 0;
++            if (this._backendType !== 'dbusmenu' && this._backendType !== 'gtk-menus')
++                return GLib.SOURCE_REMOVE;
++
++            if (_modelSignature(this._buildExportedMenuModel(this._currentAppName)) !== this._shownSignature)
++                this._emitChanged();
++            else
++                this._emitContentChanged();
++            return GLib.SOURCE_REMOVE;
++        });
++    }
++
++    // ── dbusmenu tree builders ─────────────────────────────────────────
++    // An item is remembered by its position (the indexes of the visible
++    // children on the way down from the root), not by its object: the app may
++    // replace every item at any time, and the old objects then point nowhere.
++    // The entries of a menu are listed when it is about to open: `children` is
++    // a function, for the top-level menus and for every submenu.
++
++    _buildTopLevelDescriptor(item, path) {
++        const label = _normalizeLabel(_splitLabelHint(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL))[0]);
+         if (!label)
+             return null;
+ 
+         return {
+             label,
+-            children: this._buildChildren(item),
+-            onOpen: () => this._aboutToShow(item),
++            children: () => this._childrenAt(path, label),
++            onOpen: () => this._aboutToShow(path, label),
+         };
+     }
+ 
+-    _buildChildren(parentItem) {
+-        return parentItem.get_children()
+-            .filter(item => _isVisible(item))
+-            .map(item => this._buildMenuItem(item))
++    _childrenAt(path, label) {
++        const item = this._findItem(path, label);
++        return item ? this._buildChildren(item, path) : [];
++    }
++
++    _buildChildren(parentItem, parentPath) {
++        return _visibleChildren(parentItem)
++            .map((item, index) => this._buildMenuItem(item, [...parentPath, index]))
+             .filter(Boolean);
+     }
+ 
+-    _buildMenuItem(item) {
+-        if (!_isVisible(item))
+-            return null;
++    // Whether an item would show as an entry: a separator, a label or a submenu.
++    _isEntry(item) {
++        return _isSeparator(item)
++            || Boolean(_normalizeLabel(_splitLabelHint(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL))[0]))
++            || _visibleChildren(item).some(child => this._isEntry(child));
++    }
+ 
++    _buildMenuItem(item, path) {
+         if (_isSeparator(item))
+             return { type: 'separator' };
+ 
+-        const label = _normalizeLabel(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL));
+-        const children = this._buildChildren(item);
+-        const hasSubmenu = children.length > 0;
++        const [rawLabel, labelHint] = _splitLabelHint(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL));
++        const label = _normalizeLabel(rawLabel);
++        const hasSubmenu = _visibleChildren(item).some(child => this._isEntry(child));
+ 
+         if (!label && !hasSubmenu)
+             return null;
+ 
+         if (hasSubmenu) {
++            const submenuLabel = label || _('More');
+             return {
+                 type: 'submenu',
+-                label: label || _('More'),
+-                children,
+-                onOpen: () => this._aboutToShow(item),
++                label: submenuLabel,
++                children: () => this._childrenAt(path, label),
++                onOpen: () => this._aboutToShow(path, label),
+             };
+         }
+ 
++        // A submenu with nothing in it, for example an empty "Open Recent".
++        if (item.property_get(Dbusmenu.MENUITEM_PROP_CHILD_DISPLAY) === Dbusmenu.MENUITEM_CHILD_DISPLAY_SUBMENU)
++            return { label: label || _('More'), sensitive: false };
++
+         return {
+             label: label || _('Untitled'),
+             sensitive: _isEnabled(item),
+             ornament: _getOrnament(item),
+-            activate: () => this._activateItem(item),
++            shortcut: _shortcutText(item) || labelHint,
++            activate: () => this._activateItem(path, label),
+         };
+     }
+ 
+-    _aboutToShow(item) {
+-        try {
+-            item.send_about_to_show();
+-        } catch (e) {
+-            Logger.debug(`Dbusmenu about-to-show failed: ${e}`);
++    // The item at a position, if it still carries the label it was drawn with.
++    // If the menu changed in between, a sibling with that label is used, and
++    // nothing at all rather than a different command.
++    _findItem(path, label) {
++        let parent = this._client?.get_root() ?? null;
++        for (const index of path.slice(0, -1))
++            parent = parent ? _visibleChildren(parent)[index] ?? null : null;
++        if (!parent)
++            return null;
++
++        const hasLabel = item =>
++            _normalizeLabel(_splitLabelHint(item.property_get(Dbusmenu.MENUITEM_PROP_LABEL))[0]) === label;
++        const siblings = _visibleChildren(parent);
++        const item = siblings[path.at(-1)];
++        if (item && hasLabel(item))
++            return item;
++        return siblings.find(hasLabel) ?? null;
++    }
++
++    _aboutToShow(path, label) {
++        const item = this._findItem(path, label);
++        const registration = this._currentRegistration;
++        if (!item || !registration)
++            return;
++
++        if (registration.menu) {
++            registration.menu.aboutToShow(item.get_id());
++        } else {
++            Gio.DBus.session.call(
++                registration.service, registration.path, DBUSMENU_INTERFACE, 'AboutToShow',
++                new GLib.Variant('(i)', [item.get_id()]), null, Gio.DBusCallFlags.NO_AUTO_START, 2000, null
++            ).catch(e => Logger.debug(`Dbusmenu about-to-show failed: ${e}`));
+         }
++        // Check marks and greyed-out items can change without a new layout.
++        this._onClientChanged();
+     }
+ 
+-    _activateItem(item) {
++    _activateItem(path, label) {
++        const item = this._findItem(path, label);
++        if (!item) {
++            Logger.debug(`Menu item "${label}" is gone; nothing activated.`);
++            return;
++        }
++
+         try {
+             item.handle_event(
+                 Dbusmenu.MENUITEM_EVENT_ACTIVATED,
+                 new GLib.Variant('i', 0),
+-                0,
++                global.get_current_time(),
+             );
+         } catch (e) {
+             Logger.error(`Dbusmenu activation failed: ${e}`);
+diff --git a/stylesheet.css b/stylesheet.css
+index d56850c..5dcf687 100644
+--- a/stylesheet.css
++++ b/stylesheet.css
+@@ -208,3 +208,14 @@
+     color: -st-dim-text;
+     font-size: 9pt;
+ }
++
++/* Key hint next to an item of an app's real menu */
++.appmenu-shortcut {
++    padding-left: 3em;
++    font-size: 0.92em;
++}
++
++/* A menu taller than the screen scrolls; its edge fades where it goes on. */
++.appmenu-menu-scroll {
++    -st-vfade-offset: 36px;
++}

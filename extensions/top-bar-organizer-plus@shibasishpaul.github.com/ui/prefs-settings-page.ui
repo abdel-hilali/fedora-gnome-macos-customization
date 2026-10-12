@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <template class="PrefsSettingsPage" parent="AdwPreferencesPage">
+        <property name="title">Settings</property>
+        <property name="icon-name">preferences-system-symbolic</property>
+        <child>
+            <object class="AdwPreferencesGroup">
+                <property name="title">Ordering</property>
+                <child>
+                    <object class="AdwComboRow" id="mode-row">
+                        <property name="title">Order Mode</property>
+                        <property name="subtitle">"Off" never touches tray icons. "Safe" places a newly created tray icon next to the last one once, without ever moving it again. "Full" keeps a persisted custom order for tray icons, same as other top bar items, at the cost of a small residual crash risk tray icons carry when reordered repeatedly.</property>
+                        <property name="model">
+                            <object class="GtkStringList">
+                                <items>
+                                    <item>Off</item>
+                                    <item>Safe</item>
+                                    <item>Full</item>
+                                </items>
+                            </object>
+                        </property>
+                        <!-- Without this, the row's long subtitle squeezes the
+                             collapsed selected-value label below its natural
+                             width, ellipsizing "Full" down to "F...". A fixed
+                             width-chars (as wide as the longest option) keeps
+                             it fully readable regardless of how tight the
+                             subtitle makes the row. -->
+                        <property name="factory">
+                            <object class="GtkBuilderListItemFactory">
+                                <property name="bytes"><![CDATA[
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <template class="GtkListItem">
+        <property name="child">
+            <object class="GtkLabel">
+                <property name="xalign">0</property>
+                <property name="width-chars">4</property>
+                <binding name="label">
+                    <lookup name="string" type="GtkStringObject">
+                        <lookup name="item">GtkListItem</lookup>
+                    </lookup>
+                </binding>
+            </object>
+        </property>
+    </template>
+</interface>
+                                ]]></property>
+                            </object>
+                        </property>
+                        <signal name="notify::selected-item" handler="onModeRowSelectionChanged"/>
+                    </object>
+                </child>
+            </object>
+        </child>
+        <child>
+            <object class="AdwPreferencesGroup" id="exceptions-group">
+                <property name="title">Exceptions</property>
+                <property name="description">Applications to keep out of "Full" mode reordering. Their identity is still tracked, but they're never moved — they stay wherever they currently are.</property>
+                <child>
+                    <object class="AdwEntryRow" id="add-exception-entry-row">
+                        <property name="title">Application id, e.g. Nextcloud</property>
+                        <property name="show-apply-button">True</property>
+                        <signal name="apply" handler="onAddExceptionEntryApply"/>
+                        <signal name="entry-activated" handler="onAddExceptionEntryApply"/>
+                    </object>
+                </child>
+            </object>
+        </child>
+        <child>
+            <object class="AdwPreferencesGroup">
+                <property name="title">Backup</property>
+                <property name="description">Export every setting of this extension to a file, or restore them from one previously exported.</property>
+                <child>
+                    <object class="AdwActionRow">
+                        <property name="title">Export Settings</property>
+                        <property name="subtitle">Save all current settings to a file.</property>
+                        <property name="activatable-widget">export-button</property>
+                        <child type="suffix">
+                            <object class="GtkButton" id="export-button">
+                                <property name="valign">center</property>
+                                <property name="label">Export…</property>
+                                <signal name="clicked" handler="onExportButtonClicked"/>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+                <child>
+                    <object class="AdwActionRow">
+                        <property name="title">Import Settings</property>
+                        <property name="subtitle">Replace all current settings with ones from a file. This can't be undone.</property>
+                        <property name="activatable-widget">import-button</property>
+                        <child type="suffix">
+                            <object class="GtkButton" id="import-button">
+                                <property name="valign">center</property>
+                                <property name="label">Import…</property>
+                                <signal name="clicked" handler="onImportButtonClicked"/>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+            </object>
+        </child>
+    </template>
+</interface>

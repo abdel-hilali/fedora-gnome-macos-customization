@@ -1,0 +1,12 @@
+[Unit]
+Description=Run macstyle-appfollow when an app is installed, updated or removed
+
+[Path]
+PathChanged=/usr/share/applications
+PathChanged=/usr/local/share/applications
+PathChanged=/var/lib/flatpak/exports/share/applications
+PathChanged=%h/.local/share/flatpak/exports/share/applications
+Unit=macstyle-appfollow.service
+
+[Install]
+WantedBy=default.target

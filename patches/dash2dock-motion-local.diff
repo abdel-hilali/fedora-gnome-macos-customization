@@ -1,0 +1,52 @@
+--- a/dash2dock-motion@unmade.space/extension.js
++++ b/dash2dock-motion@unmade.space/extension.js
+@@ -12,10 +12,18 @@
+ 
+ export default class ContentDockExtension extends Extension.Extension {
+     enable() {
++        // Local patch (macstyle, 2026-10-12): port of Dash to Dock v106+ (PR #2655). Disable the
++        // dock on shutdown so its idle handlers do not touch windows being disposed at logout.
++        // See https://gitlab.gnome.org/GNOME/gnome-shell/-/merge_requests/4214
++        this._shutdownID = global.connect('shutdown', () => this.disable());
+         dockManager = new DockManager(this);
+     }
+ 
+     disable() {
++        if (this._shutdownID) {
++            global.disconnect(this._shutdownID);
++            delete this._shutdownID;
++        }
+         dockManager?.destroy();
+         dockManager = null;
+     }
+--- a/dash2dock-motion@unmade.space/docking.js
++++ b/dash2dock-motion@unmade.space/docking.js
+@@ -2592,6 +2592,10 @@
+         [this._methodInjections, this._vfuncInjections, this._propertyInjections].forEach(
+             injections => injections.removeWithLabel(Labels.MAIN_DASH));
+ 
++        // Local patch (macstyle, 2026-10-12): at logout GNOME may have torn the overview down
++        // already; then there is nothing to restore, and destroy() must still remove the docks.
++        if (!this.overviewControls.layout_manager)
++            return;
+         this.overviewControls.layout_manager._dash = this._oldDash;
+         this.overviewControls.dash = this._oldDash;
+         this.searchController._showAppsButton = this._oldDash.showAppsButton;
+--- a/dash2dock-motion@unmade.space/stylesheet.css
++++ b/dash2dock-motion@unmade.space/stylesheet.css
+@@ -1530,3 +1530,15 @@
+     background-color: transparent;
+     box-shadow: none;
+ }
++
++/* macstyle patch (2026-10-12): light mode only. Blur my Shell puts light-dash
++   on #dash in light mode. The glass shadow above (18px, 35% black) leaves a grey
++   smudge around the slab over light maximized windows and, drawn under the
++   translucent slab, greys the slab itself. A faint shadow, and a grey rim that
++   shows over light windows and dark wallpaper alike. Dark mode is unchanged. */
++#dashtodockContainer.dash2dock-motion-glass #dash.light-dash .dash-background {
++    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
++}
++#dashtodockContainer.dash2dock-motion-glass-outline #dash.light-dash .dash-background {
++    border: 1px solid rgba(128, 128, 128, 0.15);
++}

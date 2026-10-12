@@ -1,0 +1,10 @@
+[Unit]
+Description=Chromium and Electron apps follow the top bar (X11 launcher copies, system title bar)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/macstyle-appfollow --settle 3
+
+[Install]
+WantedBy=graphical-session.target

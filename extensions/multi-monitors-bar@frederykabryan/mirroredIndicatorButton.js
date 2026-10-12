@@ -1,0 +1,3435 @@
+/*
+Copyright (C) 2025-2026  Frederyk Abryan Palinoan
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, visit https://www.gnu.org/licenses/.
+*/
+
+import { retainAstraSourceHeight } from './astraSourceGeometry.js';
+import St from 'gi://St';
+import Atk from 'gi://Atk';
+import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
+import GLib from 'gi://GLib';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+
+const MMWorkspacePreviewLayout = GObject.registerClass(
+    class MMWorkspacePreviewLayout extends Clutter.LayoutManager {
+        vfunc_get_preferred_width() {
+            return [0, 0];
+        }
+
+        vfunc_get_preferred_height() {
+            return [18, 18];
+        }
+
+        vfunc_allocate(container, box) {
+            const monitorIndex = Main.layoutManager.findIndexForActor(container);
+            const workArea = Main.layoutManager.getWorkAreaForMonitor(monitorIndex);
+            if (!workArea) {
+                const fallbackBox = new Clutter.ActorBox();
+                fallbackBox.set_origin(0, 0);
+                fallbackBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
+                for (const child of container.get_children ? container.get_children() : [])
+                    child.allocate(fallbackBox);
+                return;
+            }
+
+            const hscale = box.get_width() / workArea.width;
+            const vscale = box.get_height() / workArea.height;
+            if (!Number.isFinite(hscale) || !Number.isFinite(vscale) ||
+                hscale <= 0 || vscale <= 0) {
+                const fallbackBox = new Clutter.ActorBox();
+                fallbackBox.set_origin(0, 0);
+                fallbackBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
+                for (const child of container.get_children ? container.get_children() : [])
+                    child.allocate(fallbackBox);
+                return;
+            }
+
+            const children = container.get_children ? container.get_children() : [];
+
+            for (const child of children) {
+                if (!child.metaWindow) {
+                    const fallbackBox = new Clutter.ActorBox();
+                    fallbackBox.set_origin(0, 0);
+                    fallbackBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
+                    child.allocate(fallbackBox);
+                    continue;
+                }
+
+                const childBox = new Clutter.ActorBox();
+                const frameRect = child.metaWindow.get_frame_rect();
+
+                childBox.set_size(
+                    Math.max(1, Math.round(Math.min(frameRect.width, workArea.width) * hscale)),
+                    Math.max(1, Math.round(Math.min(frameRect.height, workArea.height) * vscale)));
+                childBox.set_origin(
+                    Math.round((frameRect.x - workArea.x) * hscale),
+                    Math.round((frameRect.y - workArea.y) * vscale));
+                child.allocate(childBox);
+            }
+        }
+    });
+
+// Lightweight mirrored indicator that visually clones an existing indicator
+// (e.g., Vitals) from the main panel and opens its menu anchored to this button.
+export const MirroredIndicatorButton = GObject.registerClass(
+    class MirroredIndicatorButton extends PanelMenu.Button {
+        _init(panel, role) {
+            // dontCreateMenu=true: on GNOME 50 PanelMenu.Button installs a
+            // Clutter.ClickGesture that toggles the default menu, which would
+            // swallow clicks before _onButtonPress can forward them to the
+            // source indicator's real menu. We never use the default menu.
+            super._init(0.0, null, true);
+
+
+            this._role = role;
+            this._panel = panel;
+
+            if (role === 'activities') {
+                this._initActivitiesButton();
+            } else {
+                this._initGenericIndicator(role);
+            }
+        }
+
+        _initActivitiesButton() {
+            // Create the activities indicator with workspace dots like main panel
+            this.accessible_role = Atk.Role.TOGGLE_BUTTON;
+            this.name = 'mmPanelActivities';
+            this.add_style_class_name('panel-button');
+            this.add_style_class_name('mm-activities');
+
+            // Set up for full height hover
+            this.y_expand = true;
+            this.y_align = Clutter.ActorAlign.FILL;
+
+            // Container for workspace dots - centered vertically
+            this._workspaceDotsBox = new St.BoxLayout({
+                style_class: 'workspace-dots',
+                y_align: Clutter.ActorAlign.CENTER,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_expand: true,
+            });
+
+            this.add_child(this._workspaceDotsBox);
+            this.label_actor = this._workspaceDotsBox;
+
+            // Store workspace manager reference first
+            this._workspaceManager = global.workspace_manager;
+
+            // Build initial workspace dots
+            this._updateWorkspaceDots();
+
+            // Connect to workspace changes
+            this._activeWsChangedId = this._workspaceManager.connect('active-workspace-changed',
+                this._updateWorkspaceDots.bind(this));
+            this._nWorkspacesChangedId = this._workspaceManager.connect('notify::n-workspaces',
+                this._updateWorkspaceDots.bind(this));
+
+            // Sync with overview state
+            this._showingId = Main.overview.connect('showing', () => {
+                this.add_style_pseudo_class('overview');
+                this.add_accessible_state(Atk.StateType.CHECKED);
+            });
+
+            this._hidingId = Main.overview.connect('hiding', () => {
+                this.remove_style_pseudo_class('overview');
+                this.remove_accessible_state(Atk.StateType.CHECKED);
+            });
+
+            this._sourceIndicator = null;
+        }
+
+        _updateWorkspaceDots() {
+            if (!this._workspaceDotsBox || !this._workspaceManager)
+                return;
+
+            // These dots are replaced, so dispose them before releasing ownership.
+            this._workspaceDotsBox.destroy_all_children();
+
+            const nWorkspaces = this._workspaceManager.n_workspaces;
+            const activeIndex = this._workspaceManager.get_active_workspace_index();
+
+            for (let i = 0; i < nWorkspaces; i++) {
+                const isActive = (i === activeIndex);
+                const dot = new St.Widget({
+                    style_class: isActive ? 'workspace-dot active' : 'workspace-dot',
+                    width: isActive ? 34 : 7,
+                    height: isActive ? 8 : 7,
+                    style: `border-radius: 6px; background-color: rgba(255, 255, 255, ${isActive ? '1' : '0.5'}); margin: 0 2px;`,
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                this._workspaceDotsBox.add_child(dot);
+            }
+        }
+
+        _initGenericIndicator(role) {
+            this._sourceIndicator = Main.panel.statusArea[role] || null;
+            this._isEmpty = false;
+
+            if (this._sourceIndicator) {
+                this._sourceDestroyId = this._sourceIndicator.connect('destroy', () => {
+                    this._sourceDestroyId = 0;
+                    // Tear down while the source still exists, before its children
+                    // and clones are disposed by Clutter.
+                    this.destroy();
+                });
+                // Check if the source indicator has any visible content
+                const sourceChild = this._sourceIndicator.get_first_child();
+                if (!sourceChild) {
+                    this._markEmpty();
+                    return;
+                }
+
+                // Additional check: if the source indicator or its child is not visible, skip
+                if (!this._sourceIndicator.visible) {
+                    this._markEmpty();
+                    return;
+                }
+
+                // Check for empty BoxLayout with no visible children
+                if (sourceChild instanceof St.BoxLayout) {
+                    const visibleChildren = sourceChild.get_children().filter(c => c.visible);
+                    if (visibleChildren.length === 0) {
+                        this._markEmpty();
+                        return;
+                    }
+                }
+
+                this._createIndicatorClone();
+                this._setupSourcePresenceWatchers();
+                this._syncMirrorPresence();
+            } else {
+                this._markEmpty();
+            }
+        }
+
+        _markEmpty() {
+            this._isEmpty = true;
+            this.visible = false;
+            this.reactive = false;
+            this.can_focus = false;
+            this.track_hover = false;
+        }
+
+        _setupSourcePresenceWatchers() {
+            if (this._sourcePresenceWatched)
+                return;
+            this._sourcePresenceWatched = true;
+
+            const scheduleSync = () => this._syncMirrorPresence();
+            // connectObject ties each handler to THIS button as the owner, so
+            // GJS auto-disconnects them when the button is destroyed — including
+            // C-side destruction when a monitor disappears on resume. Without
+            // this, handlers on the surviving Main.panel source indicator fire
+            // against the disposed button and crash gnome-shell.
+            const watch = (obj, signal) => {
+                if (!obj)
+                    return;
+                // Clutter child signal names differ across supported versions.
+                if (GObject.signal_lookup(signal.split('::')[0], obj.constructor.$gtype))
+                    obj.connectObject(signal, scheduleSync, this);
+            };
+
+            watch(this._sourceIndicator, 'notify::visible');
+            watch(this._sourceIndicator, 'notify::mapped');
+            watch(this._sourceIndicator, 'notify::allocation');
+            // An item can also be hidden through its container (Unite does
+            // that with its window buttons).
+            watch(this._sourceIndicator?.container, 'notify::visible');
+
+            const sourceChild = this._sourceIndicator?.get_first_child();
+            this._sourcePresenceChild = sourceChild;
+            watch(sourceChild, 'notify::visible');
+            watch(sourceChild, 'notify::mapped');
+            watch(sourceChild, 'notify::allocation');
+            watch(sourceChild, 'actor-added');
+            watch(sourceChild, 'actor-removed');
+            watch(sourceChild, 'child-added');
+            watch(sourceChild, 'child-removed');
+        }
+
+        _syncMirrorPresence() {
+            // After cleanup, _sourceIndicator is null. Bail without touching
+            // this actor — setting properties on a disposed GObject throws.
+            if (!this._sourceIndicator)
+                return;
+
+            const sourceChild = this._sourceIndicator.get_first_child();
+            const hasContent = this._sourceIndicator.visible &&
+                sourceChild &&
+                this._hasVisibleRenderableSourceContent(sourceChild);
+            // A hidden container hides the item without emptying it: the
+            // mirror stays (it is not a phantom) and comes back with its source.
+            const sourceContainer = this._sourceIndicator.container;
+            const shown = !!hasContent && (!sourceContainer || sourceContainer.visible);
+            if (!shown)
+                this._releaseSourceButtons();
+            // Coming back: let the source be laid out before the mirror shows.
+            // Otherwise the clone, which is laid out first, gives the source
+            // its natural size for a moment and the mirror is resized twice
+            // within one layout cycle (Clutter warns about that).
+            if (shown && !this.visible)
+                sourceChild.get_allocation_box();
+
+            this._isEmpty = !hasContent;
+            this.visible = shown;
+            this.reactive = shown;
+            this.can_focus = shown;
+            this.track_hover = shown;
+        }
+
+        _hasVisibleRenderableSourceContent(actor) {
+            if (!actor || actor.visible === false)
+                return false;
+
+            if (actor instanceof St.Icon)
+                return !!actor.gicon || !!actor.icon_name;
+
+            if (actor instanceof St.Label)
+                return !!actor.text && actor.text.trim().length > 0;
+
+            if (actor instanceof Clutter.Clone)
+                return true;
+
+            const children = actor.get_children ? actor.get_children() : [];
+            if (children.length === 0)
+                return true;
+
+            for (const child of children) {
+                if (this._hasVisibleRenderableSourceContent(child))
+                    return true;
+            }
+
+            return false;
+        }
+
+        _createIndicatorClone() {
+            const sourceChild = this._sourceIndicator.get_first_child();
+            if (!sourceChild) {
+                this._createFallbackIcon();
+                return;
+            }
+
+            // Astra Monitor: Treat as independent multi-component container
+            // so components have separate hover and interaction.
+            if (this._role && this._role.toLowerCase().includes('astra')) {
+                this.add_style_class_name('mm-astra-monitor');
+                this.y_expand = true;
+                this.y_align = Clutter.ActorAlign.FILL;
+
+                // Crucial: remove base panel-button so the whole thing doesn't
+                // light up like one giant button.
+                this.remove_style_class_name('panel-button');
+
+                this._createAstraMultiComponentClone(sourceChild);
+                return;
+            }
+
+            // 1. Quick Settings (Handle explicitly regardless of structure)
+            if (this._role === 'quickSettings') {
+                this.add_style_class_name('mm-quick-settings');
+                // Use FILL for full panel height hover detection
+                this.y_expand = true;
+                this.y_align = Clutter.ActorAlign.FILL;
+                const container = new St.BoxLayout({
+                    style_class: 'mm-quick-settings-box',
+                    y_align: Clutter.ActorAlign.FILL,
+                    y_expand: true,
+                });
+                this._createQuickSettingsClone(container, sourceChild);
+                this.add_child(container);
+                return;
+            }
+
+            // 2. Official Workspace Indicator. Its embedded preview mode
+            // uses real child actors for switching workspaces, so a plain
+            // Clutter.Clone looks correct but cannot receive those clicks.
+            if (this._role === 'workspace-indicator') {
+                this._createWorkspaceIndicatorMirror(sourceChild);
+                return;
+            }
+
+            // 3. Date Menu (Try optimizing with Label copy, fallback to simple clone)
+            if (this._role === 'dateMenu' && this._sourceIndicator._clockDisplay) {
+                // Create clock label directly - no extra container
+                const clockDisplay = new St.Label({
+                    style_class: 'clock',
+                    y_align: Clutter.ActorAlign.CENTER,
+                    y_expand: true,
+                });
+
+                if (!this._bindMirroredClockDisplay(clockDisplay)) {
+                    clockDisplay.destroy();
+                    this._markEmpty();
+                    return;
+                }
+
+                this.add_child(clockDisplay);
+                this._clockDisplay = clockDisplay;
+                return;
+            }
+
+            // 4. Favorites Menu (Special handling)
+            if (this._role === 'favorites-menu' || (this._role && (this._role.toLowerCase().includes('favorites') || this._role.toLowerCase().includes('favorite')))) {
+                this.add_style_class_name('mm-favorites-menu');
+                this.y_expand = true;
+                this.y_align = Clutter.ActorAlign.FILL;
+                const container = new St.BoxLayout({
+                    style_class: 'mm-favorites-menu-box',
+                    y_align: Clutter.ActorAlign.FILL,
+                    y_expand: true,
+                });
+                this._createFillClone(container, sourceChild);
+                this.add_child(container);
+                return;
+            }
+
+            // 5. Generic Handling
+            // Nothing here styles the button itself, so the panel can give it
+            // the style classes of its source.
+            this._plainMirror = true;
+            if (sourceChild instanceof St.BoxLayout) {
+                // Container is FILL to get full-height hover, but clone inside is centered
+                const container = new St.BoxLayout({
+                    style_class: sourceChild.get_style_class_name() || 'panel-status-menu-box',
+                    y_align: Clutter.ActorAlign.FILL,
+                    y_expand: true,
+                });
+                this._createSimpleClone(container, sourceChild);
+                this.add_child(container);
+            } else {
+                this._createSimpleClone(this, sourceChild);
+            }
+
+        }
+
+        _createWorkspaceIndicatorMirror(sourceChild) {
+            this.add_style_class_name('workspace-indicator');
+            this.add_style_class_name('mm-workspace-indicator');
+            this.y_expand = true;
+            this.y_align = Clutter.ActorAlign.FILL;
+
+            this._connectWorkspaceIndicatorModeWatcher();
+            this._registerWorkspaceSourceMenu();
+
+            if (this._sourceIndicator?._thumbnails?.visible) {
+                this.remove_style_class_name('name-label');
+                this.add_style_class_name('previews');
+                this._workspaceIndicatorMode = 'previews';
+                this._createWorkspacePreviewMirror();
+                return;
+            }
+
+            this.remove_style_class_name('previews');
+            this.add_style_class_name('name-label');
+            this._workspaceIndicatorMode = 'name-label';
+
+            // Fast path: the GNOME Workspace Indicator extension exposes the
+            // current workspace name via menu.activeName and emits
+            // 'active-name-changed'. Mirroring the label directly avoids the
+            // Clutter.Clone allocation-discovery lag that otherwise leaves
+            // the mirror empty until the source actor is allocated.
+            if (this._tryCreateWorkspaceNameLabelMirror())
+                return;
+
+            const container = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                y_align: Clutter.ActorAlign.CENTER,
+                x_align: Clutter.ActorAlign.CENTER,
+            });
+
+            this._createAllocationMatchedClone(container, sourceChild);
+            this.add_child(container);
+        }
+
+        _tryCreateWorkspaceNameLabelMirror() {
+            const sourceMenu = this._sourceIndicator?.menu;
+            if (!sourceMenu || !this._sourceIndicator._statusLabel ||
+                typeof sourceMenu.activeName !== 'string')
+                return false;
+
+            // Match the source extension's actor tree exactly: an outer
+            // BinLayout wrapper around a BoxLayout that holds the label and
+            // dropdown icon. Without the wrapper the BoxLayout is added as a
+            // direct child of the panel button, which lets x_expand on the
+            // label pull the icon to the right and create a visible gap.
+            const wrapper = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                x_expand: true,
+                y_expand: true,
+            });
+
+            const statusBox = new St.BoxLayout();
+
+            const label = new St.Label({
+                style_class: 'status-label',
+                y_align: Clutter.ActorAlign.CENTER,
+                text: sourceMenu.activeName,
+            });
+            statusBox.add_child(label);
+
+            statusBox.add_child(new St.Icon({
+                icon_name: 'pan-down-symbolic',
+                style_class: 'system-status-icon',
+            }));
+
+            wrapper.add_child(statusBox);
+            this.add_child(wrapper);
+
+            this._workspaceNameLabel = label;
+            this._workspaceNameStatusBox = statusBox;
+
+            this._workspaceNameLabelChangedId = sourceMenu.connect(
+                'active-name-changed',
+                () => {
+                    if (!this._workspaceNameLabel)
+                        return;
+                    this._workspaceNameLabel.set_text(sourceMenu.activeName ?? '');
+                });
+
+            return true;
+        }
+
+        _registerWorkspaceSourceMenu() {
+            const menu = this._sourceIndicator?.menu;
+            const menuManager = this._panel?.menuManager;
+            if (!menu || !menuManager || this._workspaceSourceMenuRegistered === menu)
+                return;
+
+            if (this._workspaceSourceMenuRegistered) {
+                menuManager.removeMenu(this._workspaceSourceMenuRegistered);
+            }
+
+            menuManager.addMenu(menu);
+            this._workspaceSourceMenuRegistered = menu;
+        }
+
+        _connectWorkspaceIndicatorModeWatcher() {
+            const thumbnails = this._sourceIndicator?._thumbnails;
+            if (!thumbnails)
+                return;
+
+            if (this._workspaceIndicatorModeWatchSource === thumbnails &&
+                this._workspaceIndicatorModeWatchId)
+                return;
+
+            if (this._workspaceIndicatorModeWatchSource && this._workspaceIndicatorModeWatchId)
+                this._workspaceIndicatorModeWatchSource.disconnect(this._workspaceIndicatorModeWatchId);
+
+            this._workspaceIndicatorModeWatchSource = thumbnails;
+            this._workspaceIndicatorModeWatchId = thumbnails.connect('notify::visible',
+                () => this._scheduleWorkspaceIndicatorModeRebuild());
+        }
+
+        _scheduleWorkspaceIndicatorModeRebuild() {
+            if (this._workspaceIndicatorModeRebuildId)
+                return;
+
+            this._workspaceIndicatorModeRebuildId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                this._workspaceIndicatorModeRebuildId = 0;
+                this._rebuildWorkspaceIndicatorMode();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        _rebuildWorkspaceIndicatorMode() {
+            if (!this._sourceIndicator)
+                return;
+
+            const sourceChild = this._sourceIndicator.get_first_child();
+            if (!sourceChild)
+                return;
+
+            const nextMode = this._sourceIndicator._thumbnails?.visible
+                ? 'previews'
+                : 'name-label';
+            if (nextMode === this._workspaceIndicatorMode)
+                return;
+
+            this._clearWorkspaceIndicatorContent();
+            this._createWorkspaceIndicatorMirror(sourceChild);
+            this.queue_relayout();
+        }
+
+        _clearWorkspaceIndicatorContent() {
+            if (this._workspaceNameLabelChangedId) {
+                this._sourceIndicator?.menu?.disconnect(this._workspaceNameLabelChangedId);
+                this._workspaceNameLabelChangedId = 0;
+            }
+            this._workspaceNameLabel = null;
+            this._workspaceNameStatusBox = null;
+
+            if (this._workspacePreviewUpdateId) {
+                GLib.source_remove(this._workspacePreviewUpdateId);
+                this._workspacePreviewUpdateId = 0;
+            }
+
+            if (this._workspacePreviewSignalIds) {
+                for (const { object, id } of this._workspacePreviewSignalIds) {
+                    object.disconnect(id);
+                }
+                this._workspacePreviewSignalIds = null;
+            }
+
+            this._disconnectWorkspaceWindowSignals();
+            this._workspacePreviewBox = null;
+            this._workspacePreviewButtons = null;
+
+            if (this._allocationCloneTimeouts) {
+                for (const timeoutId of this._allocationCloneTimeouts)
+                    GLib.source_remove(timeoutId);
+                this._allocationCloneTimeouts = null;
+            }
+
+            if (this._allocationCloneSignals) {
+                for (const signal of this._allocationCloneSignals) {
+                    signal.source.disconnect(signal.id);
+                }
+                this._allocationCloneSignals = null;
+            }
+
+            // Source-presence handlers were connected with connectObject(this);
+            // GJS auto-disconnects them on destroy, but disconnect explicitly
+            // for the non-destroy cleanup path too.
+            this._sourceIndicator?.disconnectObject(this);
+            this._sourceIndicator?.get_first_child()?.disconnectObject(this);
+            this._sourcePresenceWatched = false;
+
+            const children = this.get_children();
+            for (const child of children)
+                this.remove_child(child);
+        }
+
+        _createWorkspacePreviewMirror() {
+            this.set_height(30);
+
+            this._workspacePreviewBox = new St.BoxLayout({
+                style_class: 'workspaces-box',
+                y_expand: true,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: false,
+            });
+
+            this.add_child(this._workspacePreviewBox);
+            this._connectWorkspacePreviewSignals();
+            this._updateWorkspacePreviewMirror();
+        }
+
+        _connectWorkspacePreviewSignals() {
+            if (this._workspacePreviewSignalIds)
+                return;
+
+            this._workspacePreviewSignalIds = [];
+
+            const schedule = this._scheduleWorkspacePreviewUpdate.bind(this);
+            const connectSignal = (object, signal) => {
+                if (!object)
+                    return;
+
+                if (!GObject.signal_lookup(signal.split('::')[0], object.constructor.$gtype))
+                    return;
+                const id = object.connect(signal, schedule);
+                this._workspacePreviewSignalIds.push({ object, id });
+            };
+
+            connectSignal(global.workspace_manager, 'active-workspace-changed');
+            connectSignal(global.workspace_manager, 'workspace-switched');
+            connectSignal(global.workspace_manager, 'notify::n-workspaces');
+            connectSignal(global.display, 'notify::focus-window');
+            connectSignal(global.display, 'restacked');
+            connectSignal(global.display, 'window-created');
+            connectSignal(global.display, 'window-entered-monitor');
+            connectSignal(global.display, 'window-left-monitor');
+        }
+
+        _scheduleWorkspacePreviewUpdate() {
+            if (this._workspacePreviewUpdateId)
+                return;
+
+            this._workspacePreviewUpdateId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                this._workspacePreviewUpdateId = 0;
+                this._updateWorkspacePreviewMirror();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        _disconnectWorkspaceWindowSignals() {
+            if (!this._workspacePreviewWindowSignalIds)
+                return;
+
+            for (const { object, id } of this._workspacePreviewWindowSignalIds)
+                object.disconnect(id);
+
+            this._workspacePreviewWindowSignalIds = [];
+        }
+
+        _connectWorkspaceWindowSignal(window, signal) {
+            if (!this._workspacePreviewWindowSignalIds)
+                this._workspacePreviewWindowSignalIds = [];
+
+            if (!GObject.signal_lookup(signal.split('::')[0], window.constructor.$gtype))
+                return;
+            const id = window.connect(signal, this._scheduleWorkspacePreviewUpdate.bind(this));
+            this._workspacePreviewWindowSignalIds.push({ object: window, id });
+        }
+
+        _updateWorkspacePreviewMirror() {
+            if (!this._workspacePreviewBox)
+                return;
+
+            this._disconnectWorkspaceWindowSignals();
+            this._workspacePreviewBox.destroy_all_children();
+            this._workspacePreviewButtons = [];
+
+            const workspaceManager = global.workspace_manager;
+            const nWorkspaces = workspaceManager.n_workspaces;
+            const activeIndex = workspaceManager.get_active_workspace_index();
+
+            for (let i = 0; i < nWorkspaces; i++) {
+                const thumbnail = this._createWorkspacePreviewThumbnail(i, i === activeIndex);
+                this._workspacePreviewButtons.push(thumbnail);
+                this._workspacePreviewBox.add_child(thumbnail);
+            }
+        }
+
+        _createWorkspacePreviewThumbnail(index, active) {
+            const thumbnail = new St.Button({
+                reactive: false,
+                y_expand: true,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: false,
+            });
+            thumbnail.set_size(62, 30);
+            thumbnail._mmWorkspaceIndex = index;
+
+            const box = new St.BoxLayout({
+                style_class: 'workspace-box',
+                y_expand: true,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: false,
+                orientation: Clutter.Orientation.VERTICAL,
+            });
+            thumbnail.set_child(box);
+
+            const previewLayer = new St.Widget({
+                name: 'mm-workspace-preview-layer',
+                layout_manager: new MMWorkspacePreviewLayout(),
+                clip_to_allocation: true,
+                x_expand: true,
+                y_expand: true,
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.FILL,
+            });
+            previewLayer.set_size(52, 18);
+
+            const preview = new St.Bin({
+                style_class: active ? 'workspace active' : 'workspace',
+                child: previewLayer,
+                y_expand: true,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: false,
+            });
+            preview.set_size(52, 18);
+
+            box.add_child(preview);
+            this._populateWorkspacePreviewLayer(previewLayer, index, active);
+
+            return thumbnail;
+        }
+
+        _populateWorkspacePreviewLayer(previewLayer, workspaceIndex, activeWorkspace) {
+            const monitorIndex = this._panel?.monitorIndex ?? Main.layoutManager.primaryIndex;
+            const workspace = global.workspace_manager.get_workspace_by_index(workspaceIndex);
+            const workArea = Main.layoutManager.getWorkAreaForMonitor(monitorIndex);
+            if (!workspace || !workArea)
+                return;
+
+            const windows = workspace.list_windows();
+
+            for (const window of windows) {
+                if (window.skip_taskbar || window.minimized)
+                    continue;
+                if (window.get_monitor() !== monitorIndex)
+                    continue;
+
+                const frameRect = window.get_frame_rect();
+                if (frameRect.overlap && !frameRect.overlap(workArea))
+                    continue;
+
+                const preview = new St.Widget({
+                    style_class: activeWorkspace
+                        ? 'workspace-indicator-window-preview active'
+                        : 'workspace-indicator-window-preview',
+                });
+                preview.metaWindow = window;
+                previewLayer.add_child(preview);
+
+                this._connectWorkspaceWindowSignal(window, 'size-changed');
+                this._connectWorkspaceWindowSignal(window, 'position-changed');
+                this._connectWorkspaceWindowSignal(window, 'notify::minimized');
+                this._connectWorkspaceWindowSignal(window, 'notify::skip-taskbar');
+            }
+        }
+
+        _createClockDisplay(container) {
+            const clockDisplay = new St.Label({
+                style_class: 'clock',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            if (!this._bindMirroredClockDisplay(clockDisplay)) {
+                clockDisplay.destroy();
+                this._markEmpty();
+                return;
+            }
+
+            container.add_child(clockDisplay);
+            this._clockDisplay = clockDisplay;
+        }
+
+        _bindMirroredClockDisplay(clockDisplay) {
+            const sourceClockDisplay = this._sourceIndicator?._clockDisplay;
+            if (!sourceClockDisplay)
+                return false;
+
+            this._disconnectMirroredClockDisplay();
+            this._clockSourceDisplay = sourceClockDisplay;
+            this._clockDisplay = clockDisplay;
+            this._clockBinding = sourceClockDisplay.bind_property(
+                'text', clockDisplay, 'text', GObject.BindingFlags.SYNC_CREATE);
+            return true;
+        }
+
+        _disconnectMirroredClockDisplay() {
+            if (this._clockBinding) {
+                this._clockBinding.unbind();
+                this._clockBinding = null;
+            }
+
+            this._clockSourceDisplay = null;
+            this._clockDisplay = null;
+        }
+
+        _disconnectLabelCopyBindings() {
+            if (this._labelCopyBindings) {
+                for (const binding of this._labelCopyBindings)
+                    binding.unbind();
+            }
+
+            this._labelCopyBindings = [];
+        }
+
+        _createSimpleClone(parent, source) {
+            // Kopia status indicators can reserve panel width while exposing
+            // icon content through non-standard actors/pixmaps. Static icon
+            // extraction may produce an empty mirror, so keep a live clone.
+            if (this._role && this._role.toLowerCase().includes('kopia')) {
+                this._createAllocationMatchedClone(parent, source);
+                return;
+            }
+
+            // Check if this is a problematic extension that needs static icon copies
+            // (Extensions that resize during fullscreen or shrink on GNOME < 49)
+            // This includes:
+            // - Tiling extensions: resize during fullscreen
+            // - System Monitor extensions: shrink icons on GNOME < 49
+            // - AppIndicator extensions: shrink icons on GNOME < 49
+            const problematicExtensions = [
+                // Tiling extensions
+                'tiling', 'tilingshell', 'forge', 'pop-shell',
+                // System monitor extensions (shrink on GNOME < 49)
+                'system-monitor', 'system_monitor', 'vitals', 'tophat',
+                // AppIndicator/tray extensions (shrink on GNOME < 49)
+                'appindicator', 'ubuntu-appindicator', 'kstatusnotifier', 'tray',
+                // ArcMenu (squished icon fix) - checks loose 'arc' to catch variations
+                'arcmenu', 'arc-menu', 'arc',
+                // Clipboard extensions (resize during overview/fullscreen)
+                'clipboard', 'clipboard-indicator', 'clipman',
+            ];
+            const isProblematic = problematicExtensions.some(name =>
+                this._role && this._role.toLowerCase().includes(name)
+            );
+
+            if (isProblematic) {
+                // Use static icon copies for problematic extensions
+                this._createStaticIconCopy(parent, source);
+                return;
+            }
+
+            this._createAllocationMatchedClone(parent, source);
+        }
+
+        _getActorAllocationSize(actor) {
+            if (!actor)
+                return [0, 0];
+
+            const alloc = actor.get_allocation_box();
+            const width = Math.round(alloc.get_width());
+            const height = Math.round(alloc.get_height());
+            if (width > 0 && height > 0)
+                return [width, height];
+
+            const [, natWidth] = actor.get_preferred_width(-1);
+            const [, natHeight] = actor.get_preferred_height(-1);
+            return [Math.round(natWidth), Math.round(natHeight)];
+        }
+
+        _createAllocationMatchedClone(parent, source, preserveHiddenSize = false) {
+            if (preserveHiddenSize) {
+                const release = retainAstraSourceHeight(source, Main.layoutManager.panelBox, () => {
+                    // Enabling while already fullscreen has no visible sample.
+                    // Use the primary panel height minus the source parent's
+                    // theme padding, matching its normal panel allocation.
+                    const sourceParent = source.get_parent();
+                    const box = new Clutter.ActorBox({
+                        x1: 0, y1: 0,
+                        x2: sourceParent.width,
+                        y2: Main.panel.height,
+                    });
+                    return sourceParent.get_theme_node().get_content_box(box).get_height();
+                });
+                this._astraSourceSizeReleases ??= [];
+                this._astraSourceSizeReleases.push(release);
+            }
+            const wrapper = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: false,
+                y_expand: false,
+                reactive: false,
+            });
+
+            const clone = new Clutter.Clone({
+                source,
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: true,
+                y_expand: true,
+            });
+
+            wrapper.add_child(clone);
+            parent.add_child(wrapper);
+
+            const syncSize = () => {
+                const [width, height] = this._getActorAllocationSize(source);
+                if (width <= 0 || height <= 0)
+                    return;
+
+                wrapper.set_size(width, height);
+                clone.set_size(width, height);
+            };
+
+            syncSize();
+
+            const allocationId = source.connect('notify::allocation', syncSize);
+            if (!this._allocationCloneSignals)
+                this._allocationCloneSignals = [];
+            this._allocationCloneSignals.push({ source, id: allocationId });
+
+            const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                syncSize();
+                if (this._allocationCloneTimeouts)
+                    this._allocationCloneTimeouts = this._allocationCloneTimeouts.filter(id => id !== timeoutId);
+                return GLib.SOURCE_REMOVE;
+            });
+
+            if (!this._allocationCloneTimeouts)
+                this._allocationCloneTimeouts = [];
+            this._allocationCloneTimeouts.push(timeoutId);
+
+            return clone;
+        }
+
+        _createAstraMultiComponentClone(source) {
+            const root = new St.BoxLayout({
+                style_class: source.get_style_class_name() || 'panel-status-menu-box',
+                y_align: Clutter.ActorAlign.FILL,
+                y_expand: true,
+            });
+
+            // Prevent outer wrapper (this) from swallowing all pointer events,
+            // dropping monolithic hover block while retaining alignment.
+            this.reactive = false;
+            this.track_hover = false;
+            
+            const children = source.get_children ? source.get_children() : [];
+            if (children.length === 0) {
+                // Base clone fallback if structure not as expected
+                this._createAllocationMatchedClone(root, source, true);
+                this.add_child(root);
+                return;
+            }
+
+            for (const child of children) {
+                // Skip components hidden by Astra's config
+                if (child.visible === false) continue;
+
+                // Create transparent proxy wrapper sized exactly like the sub-child
+                const proxy = new St.Button({
+                    reactive: child.reactive !== false, 
+                    track_hover: child.track_hover !== false,
+                    style_class: child.get_style_class_name ? child.get_style_class_name() : 'panel-button',
+                    y_expand: true,
+                    y_align: Clutter.ActorAlign.FILL,
+                    x_expand: child.x_expand !== false,
+                    layout_manager: new Clutter.BinLayout()
+                });
+
+                // Keep proxy visibly synced with the source component dynamically
+                const visId = child.connect('notify::visible', () => {
+                    proxy.visible = child.visible;
+                });
+                
+                this._astraProxyConnections ??= [];
+                this._astraProxyConnections.push({ child, proxy, visId });
+
+                // Clone the inner content (child.box) instead of the outer widget.
+                // This way the clone shows data (icons, graphs, labels) without the
+                // panel-button hover background, so Clutter.Clone doesn't bleed the
+                // source's :hover visual to the extended monitor.
+                const cloneSource = child.box || child;
+                // Keep the content at its source allocation when the primary
+                // panel is hidden by fullscreen. Filling the proxy would scale
+                // icons and graphs to the secondary panel's available space.
+                this._createAllocationMatchedClone(proxy, cloneSource, true);
+
+                // Pipe component-specific interactions
+                this._setupAstraProxyEvents(proxy, child);
+                root.add_child(proxy);
+            }
+
+            this.add_child(root);
+            this._astraProxyContainer = root;
+        }
+
+        _registerAstraTooltipProxy(proxy, targetChild) {
+            const tooltipMenu = targetChild.tooltipMenu;
+            if (!tooltipMenu)
+                return null;
+
+            let state = targetChild._mmp_tooltipHookState;
+            if (state && state.tooltipMenu !== tooltipMenu) {
+                this._restoreAstraTooltipHook(targetChild, state);
+                state = null;
+            }
+
+            if (!state) {
+                const originalSourceActor = tooltipMenu.sourceActor;
+                const originalOpen = tooltipMenu.open.bind(tooltipMenu);
+                const originalClose = tooltipMenu.close.bind(tooltipMenu);
+
+                state = {
+                    tooltipMenu,
+                    originalSourceActor,
+                    originalOpen,
+                    originalClose,
+                    proxies: [],
+                };
+
+                targetChild._mmp_tooltipHookState = state;
+                targetChild._mmp_tooltipHooked = true;
+                tooltipMenu._mmp_origOpen = originalOpen;
+                tooltipMenu._mmp_origClose = originalClose;
+
+                tooltipMenu.open = (...args) => {
+                    const activeProxy = targetChild._mmp_activeTooltipProxy;
+                    if (activeProxy)
+                        tooltipMenu.sourceActor = activeProxy;
+
+                    originalOpen(...args);
+                };
+
+                tooltipMenu.close = (...args) => {
+                    originalClose(...args);
+
+                    if (!targetChild._mmp_activeTooltipProxy)
+                        tooltipMenu.sourceActor = originalSourceActor;
+                };
+            }
+
+            if (!state.proxies.includes(proxy))
+                state.proxies.push(proxy);
+
+            return state;
+        }
+
+        _unregisterAstraTooltipProxy(proxy, targetChild) {
+            const state = targetChild._mmp_tooltipHookState;
+            if (!state)
+                return;
+
+            state.proxies = state.proxies.filter(p => p !== proxy);
+
+            if (targetChild._mmp_activeTooltipProxy === proxy)
+                targetChild._mmp_activeTooltipProxy = null;
+
+            if (state.proxies.length === 0)
+                this._restoreAstraTooltipHook(targetChild, state);
+        }
+
+        _restoreAstraTooltipHook(targetChild, state) {
+            const tooltipMenu = state.tooltipMenu;
+            if (tooltipMenu) {
+                tooltipMenu.open = state.originalOpen;
+                tooltipMenu.close = state.originalClose;
+                tooltipMenu.sourceActor = state.originalSourceActor;
+            }
+
+            targetChild._mmp_activeTooltipProxy = null;
+            targetChild._mmp_proxyHovering = false;
+            targetChild._mmp_tooltipHooked = false;
+            targetChild._mmp_tooltipHookState = null;
+        }
+
+        _setupAstraProxyEvents(proxy, targetChild) {
+            if (!proxy.reactive) return;
+
+            // Hover visual is handled by cloning child.box (inner content) instead
+            // of child (outer panel-button). This decouples hover: the proxy provides
+            // its own panel-button:hover, and the clone only shows data content.
+
+            // Astra reuses one tooltip menu for the real source child. Every
+            // mirrored panel needs that shared menu to anchor to the proxy that
+            // is currently hovered, not the first proxy that installed the hook.
+            this._registerAstraTooltipProxy(proxy, targetChild);
+
+            // ── Fix 3: Proxy enter/leave → show/hide tooltip on extended monitor ──
+            // Astra Monitor shows tooltips via enter-event/leave-event handlers
+            // on the Header (see header.js lines 75-80). We replicate this by
+            // directly calling showTooltip()/hideTooltip() when the proxy is
+            // hovered, with a flag so our tooltipMenu.open hook knows to redirect.
+            proxy.connect('enter-event', () => {
+                targetChild._mmp_proxyHovering = true;
+                targetChild._mmp_activeTooltipProxy = proxy;
+                if (typeof targetChild.showTooltip === 'function') {
+                    targetChild.showTooltip();
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            proxy.connect('leave-event', () => {
+                targetChild._mmp_proxyHovering = false;
+                if (targetChild._mmp_activeTooltipProxy === proxy)
+                    targetChild._mmp_activeTooltipProxy = null;
+                if (typeof targetChild.hideTooltip === 'function') {
+                    targetChild.hideTooltip();
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            // Active sync (proxy only — don't propagate to source)
+            proxy.connect('notify::active', () => {
+                if (proxy.active) {
+                    proxy.add_style_pseudo_class('active');
+                } else {
+                    proxy.remove_style_pseudo_class('active');
+                }
+            });
+
+            // Click/scroll event forwarding (NOT enter/leave — those are handled above)
+            const forwardSpec = (eventName, vfuncName, event) => {
+                let handled = false;
+
+                if ((eventName === 'button-press-event' || eventName === 'touch-event') && (targetChild.menu || targetChild._menu)) {
+                    if (this._openAstraProxyMenu(proxy, targetChild)) {
+                        return Clutter.EVENT_STOP;
+                    }
+                }
+
+                try {
+                    targetChild._mmp_inForwardSpec = true;
+                    const vfunc = targetChild[vfuncName];
+                    if (typeof vfunc === 'function') {
+                        const result = vfunc.call(targetChild, event);
+                        if (result === Clutter.EVENT_STOP) handled = true;
+                    }
+                    if (!handled && typeof targetChild.emit === 'function') {
+                        targetChild.emit(eventName, event);
+                        handled = true;
+                    }
+                } finally {
+                    targetChild._mmp_inForwardSpec = false;
+                }
+
+                return handled ? Clutter.EVENT_STOP : Clutter.EVENT_PROPAGATE;
+            };
+
+            proxy.connect('button-press-event', (_, event) => forwardSpec('button-press-event', 'vfunc_button_press_event', event));
+            proxy.connect('button-release-event', (_, event) => forwardSpec('button-release-event', 'vfunc_button_release_event', event));
+            proxy.connect('scroll-event', (_, event) => forwardSpec('scroll-event', 'vfunc_scroll_event', event));
+            proxy.connect('touch-event', (_, event) => forwardSpec('touch-event', 'vfunc_touch_event', event));
+        }
+
+        _openAstraProxyMenu(proxy, targetChild) {
+            const menu = targetChild.menu || targetChild._menu;
+            
+            if (!menu || menu.isOpen === undefined) return false;
+
+            if (this._astraMenuRestoreId) {
+                GLib.source_remove(this._astraMenuRestoreId);
+                this._astraMenuRestoreId = 0;
+            }
+            if (this._astraMenuPendingRestore) {
+                this._astraMenuPendingRestore();
+                this._astraMenuPendingRestore = null;
+            }
+
+            let originalSourceActor = menu.sourceActor;
+            let originalBoxPointer = menu.box?._sourceActor;
+            let originalSetActive = targetChild.setActive?.bind(targetChild);
+            let originalAddPseudoClass = targetChild.add_style_pseudo_class?.bind(targetChild);
+
+            let menuBoxState = null;
+            let openStateId = 0;
+            let restored = false;
+
+            const keepAnchoredToProxy = () => {
+                menu.sourceActor = proxy;
+                for (const actor of [menu.box, menu._boxPointer]) {
+                    if (!actor)
+                        continue;
+
+                    actor._sourceActor = proxy;
+                    actor._sourceAllocation = null;
+                }
+            };
+
+            const restoreSourceActor = () => {
+                menu.sourceActor = originalSourceActor;
+                if (menu.box)
+                    menu.box._sourceActor = originalBoxPointer;
+
+                if (menuBoxState?.sourceActorState) {
+                    for (const state of menuBoxState.sourceActorState) {
+                        state.actor._sourceActor = state.sourceActor;
+                        state.actor._sourceAllocation = state.sourceAllocation;
+                    }
+                }
+
+                this._astraMenuRestoreId = 0;
+                this._astraMenuPendingRestore = null;
+                return GLib.SOURCE_REMOVE;
+            };
+
+            const restoreAfterClose = () => {
+                if (restored)
+                    return;
+                restored = true;
+
+                if (openStateId) {
+                    menu.disconnect(openStateId);
+                    openStateId = 0;
+                }
+
+                if (originalSetActive)
+                    targetChild.setActive = originalSetActive;
+                if (originalAddPseudoClass)
+                    targetChild.add_style_pseudo_class = originalAddPseudoClass;
+
+                targetChild.remove_style_pseudo_class('active');
+                targetChild.remove_style_pseudo_class('checked');
+                proxy.remove_style_pseudo_class('active');
+                proxy.remove_style_pseudo_class('checked');
+
+                if (this._astraMenuRestoreId)
+                    GLib.source_remove(this._astraMenuRestoreId);
+
+                keepAnchoredToProxy();
+                this._astraMenuPendingRestore = restoreSourceActor;
+                this._astraMenuRestoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, restoreSourceActor);
+            };
+
+            if (menu.isOpen) {
+                keepAnchoredToProxy();
+                openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                    if (!isOpen)
+                        restoreAfterClose();
+                });
+                menu.close();
+                return true;
+            }
+
+            // Prevent active state on main panel indicator
+            if (targetChild.setActive) {
+                targetChild.setActive = () => { };
+            }
+            if (targetChild.add_style_pseudo_class) {
+                const orig = targetChild.add_style_pseudo_class.bind(targetChild);
+                targetChild.add_style_pseudo_class = (p) => {
+                    if (p !== 'active' && p !== 'checked') orig(p);
+                };
+            }
+            if (targetChild.remove_style_pseudo_class) {
+                targetChild.remove_style_pseudo_class('active');
+                targetChild.remove_style_pseudo_class('checked');
+            }
+
+            // Activate proxy
+            proxy.add_style_pseudo_class('active');
+            proxy.add_style_pseudo_class('checked');
+
+            keepAnchoredToProxy();
+
+            menuBoxState = this._updateMenuPositioningNative(menu, proxy);
+
+            openStateId = menu.connect('open-state-changed', (m, isOpen) => {
+                if (isOpen) {
+                    proxy.add_style_pseudo_class('active');
+                    proxy.add_style_pseudo_class('checked');
+                    targetChild.remove_style_pseudo_class('active');
+                    targetChild.remove_style_pseudo_class('checked');
+                } else {
+                    restoreAfterClose();
+                }
+            });
+
+            menu.open();
+
+            if (!menu.isOpen)
+                restoreAfterClose();
+
+            return true;
+        }
+
+        _createQuickSettingsClone(parent, source) {
+            // Clutter.Clone paints the source at the source's ALLOCATION size,
+            // but get_preferred_width/height returns the source's PREFERRED size.
+            // On the primary panel, allocation ≠ preferred (panel constrains the source).
+            // - CENTER/y_expand:false → clone gets preferred height → too short → compresses
+            // - FILL/y_expand:true → clone fills secondary panel → too tall → stretches
+            //
+            // The ONLY correct approach: explicitly set the clone's size to match
+            // the source's actual allocation dimensions, then track changes.
+            const clone = new Clutter.Clone({
+                source: source,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: false,
+                y_expand: false,
+            });
+
+            parent.add_child(clone);
+
+            this._quickSettingsClone = clone;
+            this._quickSettingsSource = source;
+            this._quickSettingsContainer = parent;
+            this._lastSourceW = 0;
+            this._lastSourceH = 0;
+
+            // Sync clone size to source's actual allocation (not preferred size)
+            const syncSize = () => {
+                if (!this._quickSettingsSource || !this._quickSettingsClone)
+                    return;
+                const alloc = this._quickSettingsSource.get_allocation_box();
+                const w = alloc.get_width();
+                const h = alloc.get_height();
+
+                if (w > 0 && h > 0 &&
+                    (Math.abs(w - this._lastSourceW) > 0.5 ||
+                        Math.abs(h - this._lastSourceH) > 0.5)) {
+                    this._lastSourceW = w;
+                    this._lastSourceH = h;
+                    this._quickSettingsClone.set_size(Math.round(w), Math.round(h));
+                }
+            };
+
+            // Disconnect previous signal if any
+            if (this._sourceSizeChangedId && this._quickSettingsSource) {
+                this._quickSettingsSource.disconnect(this._sourceSizeChangedId);
+                this._sourceSizeChangedId = null;
+            }
+
+            // Track source allocation changes
+            this._sourceSizeChangedId = source.connect('notify::allocation', syncSize);
+
+            // Initial sync after first layout pass
+            this._qsInitialSyncId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                syncSize();
+                this._qsInitialSyncId = null;
+                return GLib.SOURCE_REMOVE;
+            });
+
+            // Monitor fullscreen state changes on primary monitor
+            this._fullscreenChangedId = global.display.connect('in-fullscreen-changed',
+                this._onQuickSettingsFullscreenChanged.bind(this));
+        }
+
+        _onQuickSettingsFullscreenChanged() {
+            if (!this._quickSettingsClone) return;
+            // The allocation sync will handle size changes from fullscreen
+            // Just queue a relayout to pick up the new source allocation
+            this._quickSettingsClone.queue_relayout();
+        }
+
+        _applyNormalMode() {
+            // Not used
+        }
+
+        _applyOverviewMode() {
+            // Not used
+        }
+
+        _monitorSize(duration) {
+            // Since we removed the clipping container and use FILL,
+            // this just tracks the max observed width for reference
+            if (this._monitorTimeoutId) {
+                GLib.source_remove(this._monitorTimeoutId);
+                this._monitorTimeoutId = null;
+            }
+
+            const startTime = GLib.get_monotonic_time();
+            const endTime = startTime + (duration * 1000);
+
+            const checkSize = () => {
+                if (!this._quickSettingsSource) {
+                    this._monitorTimeoutId = null;
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                // Get source size (max of actual and preferred)
+                const [minW, natW] = this._quickSettingsSource.get_preferred_width(-1);
+                const [actW] = this._quickSettingsSource.get_size();
+                const sourceWidth = Math.max(natW, minW, actW);
+
+                // Track max observed width
+                if (sourceWidth > (this._cachedWidth || 0)) {
+                    this._cachedWidth = sourceWidth;
+                }
+
+                // Stop after duration
+                if (GLib.get_monotonic_time() > endTime) {
+                    this._monitorTimeoutId = null;
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                return GLib.SOURCE_CONTINUE;
+            };
+
+            this._monitorTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, checkSize);
+        }
+
+        _onSourceWidthChanged() {
+            // Do nothing if width is locked (initial size captured)
+            if (this._widthLocked) {
+                return;
+            }
+            // Before locked, track the width
+            if (this._monitorTimeoutId) {
+                // Already monitoring, let it handle
+            } else {
+                this._monitorSize(500);
+            }
+        }
+
+        _detectAndLockWidth() {
+            // Unused - replaced by initial size capture
+        }
+
+        _isPrimaryMonitorFullscreen() {
+            // Check if any window is fullscreen on the primary monitor
+            const primaryIndex = Main.layoutManager.primaryIndex;
+            const windows = global.get_window_actors();
+
+            for (const actor of windows) {
+                const metaWindow = actor.get_meta_window();
+                if (metaWindow &&
+                    metaWindow.is_fullscreen() &&
+                    metaWindow.get_monitor() === primaryIndex) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        _createStaticIconCopy(parent, source) {
+            // Create static icon copies for problematic extensions (Tiling Shell, etc.)
+            // These are immune to source changes during fullscreen
+            const isClipboard = this._isClipboardIndicator();
+
+            // Only inherit the source's style class when it's a container
+            // (e.g., Vitals' BoxLayout with 'vitals-panel-menu' spacing).
+            // For sources that are themselves an St.Icon (Tiling Shell adds an
+            // icon directly under PanelMenu.Button), the class is icon-only
+            // (e.g. 'system-status-icon indicator-icon') and applying it to
+            // the wrapping BoxLayout double-pads the mirror — both the
+            // container and the inner icon copy get the system-status-icon
+            // padding, so the mirror sits noticeably wider than the source.
+            const sourceContainerClass = source instanceof St.BoxLayout
+                ? source.get_style_class_name()
+                : null;
+            const isIconOnlySource = source instanceof St.Icon;
+
+            const container = new St.BoxLayout({
+                style_class: isClipboard
+                    ? 'panel-status-menu-box mm-static-indicator-copy mm-clipboard-indicator-copy'
+                    : `${sourceContainerClass || 'panel-status-menu-box'} mm-static-indicator-copy${isIconOnlySource ? ' mm-static-icon-only-copy' : ''}`,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                y_expand: false,
+                reactive: false,
+            });
+
+            // Copy all icons from the source
+            this._copyIconsFromSource(container, source);
+
+            // Generic safety net: if static extraction produced no renderable
+            // content (common with pixmap/custom actors), fall back to a live
+            // allocation-matched clone so mirrors are never blank placeholders.
+            if (!this._hasRenderableMirrorContent(container)) {
+                container.destroy();
+                this._createAllocationMatchedClone(parent, source);
+                return;
+            }
+
+            // Parent first: sizing asks the container (and the copied icon) for
+            // their preferred size, which needs a theme node. Off-stage actors
+            // have none, so doing it the other way round both logs
+            // "st_widget_get_theme_node called on [...] which is not in the stage"
+            // and measures without the theme's padding.
+            parent.add_child(container);
+            this._syncStaticCopyContainerSize(container, source);
+            this._bindIconSyncSource(container, source);
+
+            // Periodically sync icons (every 5 seconds) to catch icon changes
+            this._startIconSync();
+        }
+
+        _bindIconSyncSource(container, source) {
+            this._disconnectIconSyncSource();
+
+            this._iconContainer = container;
+            this._iconSource = source;
+            this._iconContainerDestroyId = container.connect('destroy', () => {
+                this._iconContainerDestroyId = 0;
+                this._disconnectIconSyncSource();
+            });
+            this._iconSourceDestroyId = source.connect('destroy', () => {
+                this._iconSource = null;
+                this._iconSourceDestroyId = 0;
+                if (this._iconSyncId) {
+                    GLib.source_remove(this._iconSyncId);
+                    this._iconSyncId = null;
+                }
+            });
+        }
+
+        _disconnectIconSyncSource() {
+            if (this._iconContainerDestroyId && this._iconContainer) {
+                this._iconContainer.disconnect(this._iconContainerDestroyId);
+                this._iconContainerDestroyId = 0;
+            }
+
+            if (this._iconSourceDestroyId && this._iconSource) {
+                this._iconSource.disconnect(this._iconSourceDestroyId);
+                this._iconSourceDestroyId = 0;
+            }
+
+            this._iconContainer = null;
+            this._iconSource = null;
+        }
+
+        _copyIconsFromSource(container, source) {
+            // Release label bindings from the previous build before the copies
+            // they target are removed/disposed below.
+            this._disconnectLabelCopyBindings();
+
+            // Replaced copies must be destroyed explicitly. Merely unparenting
+            // them defers destruction to GC, where GJS cannot run destroy handlers.
+            container.destroy_all_children();
+
+            if (this._isClipboardIndicator()) {
+                this._copyClipboardIconFromSource(container, source);
+                return;
+            }
+
+            // Preserve one level of grouping for indicators like Vitals where
+            // spacing is defined on each child metric box, but do not assume
+            // every direct child is a BoxLayout. AppIndicator/tray providers can
+            // mix BoxLayouts with button/bin wrappers, and returning after the
+            // first preserved group drops those wrapped icons from secondary
+            // panels.
+            if (source instanceof St.BoxLayout) {
+                const sourceChildren = source.get_children();
+                let copiedAnyChildren = false;
+
+                for (const child of sourceChildren) {
+                    if (child.visible === false)
+                        continue;
+
+                    if (child instanceof St.Icon || child instanceof St.Label) {
+                        const widgetCopy = this._createDisplayWidgetCopy(child);
+                        if (widgetCopy) {
+                            container.add_child(widgetCopy);
+                            copiedAnyChildren = true;
+                        }
+                        continue;
+                    }
+
+                    const widgets = this._findAllDisplayWidgets(child);
+                    if (widgets.length === 0) {
+                        const cloneCopy = this._createRenderableActorClone(child);
+                        if (cloneCopy) {
+                            container.add_child(cloneCopy);
+                            copiedAnyChildren = true;
+                        }
+                        continue;
+                    }
+
+                    const groupCopy = new St.BoxLayout({
+                        style_class: (child instanceof St.Widget && child.get_style_class_name()) || '',
+                        x_align: Clutter.ActorAlign.CENTER,
+                        y_align: Clutter.ActorAlign.CENTER,
+                        y_expand: false,
+                        reactive: false,
+                    });
+
+                    for (const widget of widgets) {
+                        const widgetCopy = this._createDisplayWidgetCopy(widget);
+                        if (widgetCopy)
+                            groupCopy.add_child(widgetCopy);
+                    }
+
+                    if (groupCopy.get_n_children() === 0) {
+                        groupCopy.destroy();
+                        continue;
+                    }
+
+                    container.add_child(groupCopy);
+                    copiedAnyChildren = true;
+                }
+
+                if (copiedAnyChildren)
+                    return;
+            }
+
+            // Find all display widgets (icons and labels) in the source and create copies
+            const widgets = this._findAllDisplayWidgets(source);
+
+            if (widgets.length > 0) {
+                for (const widget of widgets) {
+                    if (widget instanceof St.Icon) {
+                        const iconCopy = new St.Icon({
+                            gicon: widget.gicon,
+                            icon_name: widget.icon_name,
+                            icon_size: this._getSourceIconSize(widget),
+                            style_class: widget.get_style_class_name() || 'system-status-icon',
+                            x_align: Clutter.ActorAlign.CENTER,
+                            y_align: Clutter.ActorAlign.CENTER,
+                            x_expand: false,
+                            y_expand: false,
+                        });
+                        container.add_child(iconCopy);
+                    } else if (widget instanceof St.Label) {
+                        // Skip labels for ArcMenu and Clipboard indicators
+                        // ArcMenu: user request; Clipboard: shows clipboard content as label
+                        if (this._role && (
+                            this._role.toLowerCase().includes('arc') ||
+                            this._role.toLowerCase().includes('clipboard') ||
+                            this._role.toLowerCase().includes('clipman')
+                        )) {
+                            continue;
+                        }
+
+                        // Copy labels (like Vitals' numbers/text values)
+                        const labelCopy = this._createLabelCopy(widget);
+                        container.add_child(labelCopy);
+                    }
+                }
+            } else {
+                // Fallback: use a clone but wrap it to prevent resize
+                const clone = new Clutter.Clone({
+                    source: source,
+                    x_align: Clutter.ActorAlign.CENTER,
+                    y_align: Clutter.ActorAlign.CENTER,
+                    x_expand: false,
+                    y_expand: false,
+                });
+                container.add_child(clone);
+            }
+        }
+
+        _createDisplayWidgetCopy(widget) {
+            if (widget instanceof St.Icon) {
+                return new St.Icon({
+                    gicon: widget.gicon,
+                    icon_name: widget.icon_name,
+                    icon_size: this._getSourceIconSize(widget),
+                    style_class: widget.get_style_class_name() || 'system-status-icon',
+                    x_align: Clutter.ActorAlign.CENTER,
+                    y_align: Clutter.ActorAlign.CENTER,
+                    x_expand: false,
+                    y_expand: false,
+                });
+            }
+
+            if (widget instanceof St.Label) {
+                if (this._shouldSkipStaticLabelCopy())
+                    return null;
+
+                return this._createLabelCopy(widget);
+            }
+
+            return null;
+        }
+
+        _createLabelCopy(sourceLabel) {
+            const labelCopy = new St.Label({
+                style_class: sourceLabel.get_style_class_name() || '',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            // The binding outlives labelCopy.destroy(): it is released only
+            // when *either* label is finalized (GC'd), and sourceLabel is the
+            // long-lived panel label. Track the binding so we can unbind() it
+            // on the next rebuild / cleanup. Otherwise each 5s rebuild orphans
+            // a copy whose disposed St.Label still receives source 'text'
+            // updates -> "St.Label has been already disposed" spam.
+            // Do not attach JS callbacks to St.Label::destroy: GJS 1.86
+            // (GNOME 50) blocks those callbacks if finalization happens while
+            // SpiderMonkey is sweeping the wrappers.
+            const binding = sourceLabel.bind_property(
+                'text', labelCopy, 'text', GObject.BindingFlags.SYNC_CREATE);
+            (this._labelCopyBindings ??= []).push(binding);
+
+            return labelCopy;
+        }
+
+        _createRenderableActorClone(source) {
+            if (!source || source.visible === false)
+                return null;
+
+            const wrapper = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                style_class: (source instanceof St.Widget && source.get_style_class_name()) || '',
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: false,
+                y_expand: false,
+                reactive: false,
+            });
+
+            const clone = new Clutter.Clone({
+                source,
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.FILL,
+                x_expand: true,
+                y_expand: true,
+            });
+            wrapper.add_child(clone);
+
+            const syncSize = () => {
+                const [width, height] = this._getActorAllocationSize(source);
+                if (width > 0 && height > 0)
+                    wrapper.set_size(width, height);
+            };
+            syncSize();
+
+            return wrapper;
+        }
+
+        _shouldSkipStaticLabelCopy() {
+            const role = this._role ? this._role.toLowerCase() : '';
+            return role.includes('arc') ||
+                role.includes('clipboard') ||
+                role.includes('clipman');
+        }
+
+        _copyClipboardIconFromSource(container, source) {
+            const icon = this._sourceIndicator?.icon || this._findIconInActor(source);
+            if (!icon) {
+                const fallbackIcon = new St.Icon({
+                    icon_name: 'edit-paste-symbolic',
+                    style_class: 'system-status-icon',
+                    icon_size: 16,
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                container.add_child(fallbackIcon);
+                return;
+            }
+
+            const iconCopy = new St.Icon({
+                gicon: icon.gicon,
+                icon_name: icon.icon_name || 'edit-paste-symbolic',
+                icon_size: Math.min(this._getSourceIconSize(icon), 16),
+                style_class: icon.get_style_class_name() || 'system-status-icon',
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: false,
+                y_expand: false,
+            });
+            container.add_child(iconCopy);
+        }
+
+        _getSourceIconSize(icon) {
+            // Honor an explicit icon_size set by the source. If the source
+            // leaves it as the default (-1 / 0), return -1 so the iconCopy
+            // also uses the theme default — falling back to the source's
+            // allocation here would size the icon to the actor box (icon
+            // graphic + padding), which renders the mirror's icon larger
+            // than the source.
+            if (icon.icon_size && icon.icon_size > 0)
+                return icon.icon_size;
+
+            return -1;
+        }
+
+        _syncStaticCopyContainerSize(container, source) {
+            const syncSize = () => {
+                if (this._isClipboardIndicator()) {
+                    const [minWidth, natWidth] = container.get_preferred_width(-1);
+                    const [, natHeight] = container.get_preferred_height(-1);
+                    const width = Math.round(natWidth || minWidth);
+                    const height = Math.round(natHeight);
+
+                    if (width > 0 && height > 0)
+                        container.set_size(width, height);
+                    return;
+                }
+
+                // Icon-only indicators (e.g. Tiling Shell) can have asymmetric
+                // allocation from the source button wrapper. Mirroring that raw
+                // allocation width makes the icon look off-center on secondary
+                // panels, so use the copied icon's natural size instead.
+                if (source instanceof St.Icon) {
+                    const [minWidth, natWidth] = container.get_preferred_width(-1);
+                    const [, natHeight] = container.get_preferred_height(-1);
+                    const width = Math.round(natWidth || minWidth);
+                    const height = Math.round(natHeight);
+
+                    if (width > 0 && height > 0)
+                        container.set_size(width, height);
+                    return;
+                }
+
+                const [width, height] = this._getActorAllocationSize(source);
+                if (width > 0 && height > 0)
+                    container.set_size(width, height);
+            };
+
+            syncSize();
+
+            const allocationId = source.connect('notify::allocation', syncSize);
+            if (!this._allocationCloneSignals)
+                this._allocationCloneSignals = [];
+            this._allocationCloneSignals.push({ source, id: allocationId });
+        }
+
+        _findAllDisplayWidgets(actor) {
+            // Recursively find all St.Icon and St.Label instances in an actor tree
+            // This preserves their order for proper display (e.g., Vitals: icon + number)
+            const widgets = [];
+            if (actor instanceof St.Icon || actor instanceof St.Label) {
+                widgets.push(actor);
+            }
+            const children = actor.get_children ? actor.get_children() : [];
+            for (const child of children) {
+                widgets.push(...this._findAllDisplayWidgets(child));
+            }
+            return widgets;
+        }
+
+        _hasRenderableMirrorContent(actor) {
+            if (!actor)
+                return false;
+
+            if (actor instanceof Clutter.Clone)
+                return true;
+
+            if (actor instanceof St.Icon)
+                return !!actor.gicon || !!actor.icon_name;
+
+            if (actor instanceof St.Label)
+                return !!actor.text && actor.text.trim().length > 0;
+
+            const children = actor.get_children ? actor.get_children() : [];
+            for (const child of children) {
+                if (this._hasRenderableMirrorContent(child))
+                    return true;
+            }
+
+            return false;
+        }
+
+        _startIconSync() {
+            if (this._iconSyncId) {
+                GLib.source_remove(this._iconSyncId);
+                this._iconSyncId = null;
+            }
+
+            // Full rebuild every 5 seconds to catch added/removed icons
+            this._iconSyncId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+                if (!this._iconContainer || !this._iconSource) {
+                    this._iconSyncId = null;
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                this._copyIconsFromSource(this._iconContainer, this._iconSource);
+                return GLib.SOURCE_CONTINUE;
+            });
+        }
+
+        _createFillClone(parent, source) {
+            // For favorites-menu@fthx - create real widget copy instead of Clutter.Clone
+            // This prevents visual glitches when the main panel hides during fullscreen
+            const container = new St.BoxLayout({
+                style_class: source.get_style_class_name ? source.get_style_class_name() : 'panel-status-menu-box',
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                y_expand: true,
+                reactive: false,
+            });
+
+            // Find and copy the icon from the source (favorites-menu uses starred-symbolic icon)
+            const icon = this._findIconInActor(source);
+            if (icon) {
+                const iconCopy = new St.Icon({
+                    gicon: icon.gicon,
+                    icon_name: icon.icon_name || 'starred-symbolic',
+                    icon_size: icon.icon_size || 16,
+                    style_class: icon.get_style_class_name() || 'system-status-icon',
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                container.add_child(iconCopy);
+            } else {
+                // Fallback: create the starred icon directly
+                const fallbackIcon = new St.Icon({
+                    icon_name: 'starred-symbolic',
+                    style_class: 'system-status-icon',
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                container.add_child(fallbackIcon);
+            }
+
+            parent.add_child(container);
+            this._favoritesContainer = container;
+        }
+
+        _findIconInActor(actor) {
+            // Recursively find St.Icon in an actor tree
+            if (actor instanceof St.Icon) {
+                return actor;
+            }
+            const children = actor.get_children ? actor.get_children() : [];
+            for (const child of children) {
+                const found = this._findIconInActor(child);
+                if (found) return found;
+            }
+            return null;
+        }
+
+        _createFallbackIcon() {
+            // Keep for backward compatibility, but never present fallback content
+            // in mirrored status area because it creates clickable ghost slots.
+            this._markEmpty();
+        }
+
+        vfunc_button_press_event(buttonEvent) {
+            return this._onButtonPress(buttonEvent);
+        }
+
+        vfunc_scroll_event(scrollEvent) {
+            if (this._role === 'workspace-indicator') {
+                Main.wm.handleWorkspaceScroll(scrollEvent);
+                return Clutter.EVENT_STOP;
+            }
+
+            return Clutter.EVENT_PROPAGATE;
+        }
+
+        // The buttons of a source that is a plain row of buttons without a
+        // menu, such as Unite's window buttons.
+        _getSourceButtons() {
+            const source = this._sourceIndicator;
+            if (!source || (source.menu && !(source.menu instanceof PopupMenu.PopupDummyMenu)))
+                return [];
+
+            const box = source.get_first_child();
+            if (!(box instanceof St.BoxLayout))
+                return [];
+
+            const children = box.get_children().filter(child => child.visible);
+            return children.length > 0 && children.every(child => child instanceof St.Button)
+                ? children : [];
+        }
+
+        _findCloneOf(source, actor = this) {
+            for (const child of actor.get_children()) {
+                if (child instanceof Clutter.Clone && child.source === source)
+                    return child;
+
+                const found = this._findCloneOf(source, child);
+                if (found)
+                    return found;
+            }
+
+            return null;
+        }
+
+        // The source button drawn under the pointer. Like the source, a
+        // button takes the full height of the panel.
+        _sourceButtonAt(event, buttons) {
+            const box = buttons[0].get_parent();
+            const clone = this._findCloneOf(box);
+            if (!clone || box.width <= 0)
+                return null;
+
+            const [stageX, stageY] = event.get_coords();
+            const [ok, x] = clone.transform_stage_point(stageX, stageY);
+            if (!ok)
+                return null;
+
+            const scale = clone.width / box.width;
+            return buttons.find(button => {
+                const allocation = button.get_allocation_box();
+                return x >= allocation.x1 * scale && x < allocation.x2 * scale;
+            }) ?? null;
+        }
+
+        // Such a row is shown here as one picture: pass hover, press and click
+        // on to the button under the pointer. The click then does what it does
+        // on the main panel.
+        _forwardToSourceButtons(event) {
+            const type = event.type();
+            const isButton = type === Clutter.EventType.BUTTON_PRESS ||
+                type === Clutter.EventType.BUTTON_RELEASE;
+            if (!isButton && type !== Clutter.EventType.MOTION &&
+                type !== Clutter.EventType.ENTER && type !== Clutter.EventType.LEAVE)
+                return false;
+
+            const buttons = this._getSourceButtons();
+            if (buttons.length === 0)
+                return false;
+
+            const target = type === Clutter.EventType.LEAVE
+                ? null : this._sourceButtonAt(event, buttons);
+            this._sourceButtonsInUse = true;
+            for (const button of buttons)
+                button.set_hover(button === target);
+
+            // A press ends with the release, or when the pointer leaves.
+            if (type === Clutter.EventType.LEAVE ||
+                (isButton && event.get_button() === Clutter.BUTTON_PRIMARY)) {
+                const pressed = this._pressedSourceButton ?? null;
+                this._pressedSourceButton = null;
+                pressed?.remove_style_pseudo_class('active');
+
+                if (type === Clutter.EventType.BUTTON_PRESS) {
+                    this._pressedSourceButton = target;
+                    target?.add_style_pseudo_class('active');
+                } else if (type === Clutter.EventType.BUTTON_RELEASE &&
+                    pressed && pressed === target) {
+                    pressed.emit('clicked', Clutter.BUTTON_PRIMARY);
+                }
+            }
+
+            return isButton;
+        }
+
+        // Take back the hover and press this mirror put on the source's buttons.
+        _releaseSourceButtons() {
+            if (!this._sourceButtonsInUse)
+                return;
+
+            this._sourceButtonsInUse = false;
+            this._pressedSourceButton = null;
+            for (const button of this._getSourceButtons()) {
+                button.set_hover(false);
+                button.remove_style_pseudo_class('active');
+            }
+        }
+
+        vfunc_event(event) {
+            if (this._forwardToSourceButtons(event))
+                return Clutter.EVENT_STOP;
+
+            if (event.type() === Clutter.EventType.BUTTON_PRESS) {
+                return this.vfunc_button_press_event(event);
+            }
+            if (event.type() === Clutter.EventType.SCROLL) {
+                return this.vfunc_scroll_event(event);
+            }
+            return Clutter.EVENT_PROPAGATE;
+        }
+
+        _onButtonPress(event = null) {
+            if (this._role === 'activities') {
+                Main.overview.toggle();
+                return Clutter.EVENT_STOP;
+            }
+
+            if (this._role === 'workspace-indicator') {
+                if (event?.get_button() === Clutter.BUTTON_SECONDARY &&
+                    this._sourceIndicator?.menu) {
+                    return this._openWorkspaceIndicatorMenu();
+                }
+
+                if (this._sourceIndicator?._thumbnails?.visible &&
+                    event?.get_button() === Clutter.BUTTON_PRIMARY &&
+                    this._activateWorkspacePreviewAt(event)) {
+                    return Clutter.EVENT_STOP;
+                }
+
+                if (this._sourceIndicator?.menu)
+                    return this._openWorkspaceIndicatorMenu();
+            }
+
+            if (this._isClipboardIndicator() && this._sourceIndicator?.menu) {
+                return this._openClipboardIndicatorMenu();
+            }
+
+            if (this._role === 'quickSettings' && this._sourceIndicator?.menu) {
+                return this._openQuickSettingsMenu();
+            }
+
+            // Check for standard menu first
+            if (this._sourceIndicator && this._sourceIndicator.menu) {
+                return this._openMirroredMenu();
+            }
+
+            // Handle extensions with custom popup menus (like favorite-apps-menu@venovar)
+            // These extensions have _popupFavoriteAppsMenu or similar custom menus
+            if (this._sourceIndicator) {
+                // ArcMenu specific: try toggleMenu method directly
+                if (typeof this._sourceIndicator.toggleMenu === 'function') {
+                    return this._openArcMenu();
+                }
+
+                // ArcMenu specific: try arcMenu property
+                if (this._sourceIndicator.arcMenu && typeof this._sourceIndicator.arcMenu.toggle === 'function') {
+                    return this._openArcMenu();
+                }
+
+                // ArcMenu specific: try _menuButton.toggleMenu
+                if (this._sourceIndicator._menuButton && typeof this._sourceIndicator._menuButton.toggleMenu === 'function') {
+                    return this._openArcMenu();
+                }
+
+                // Try to find and open custom popup menus
+                const customMenus = [
+                    '_popupFavoriteAppsMenu',
+                    '_popupPowerItemsMenu',
+                    '_popup',
+                    '_popupMenu'
+                ];
+
+                for (const menuName of customMenus) {
+                    if (this._sourceIndicator[menuName]?.toggle) {
+                        return this._openCustomPopupMenu(this._sourceIndicator[menuName]);
+                    }
+                }
+
+                // If no menu found, try to emit a button press on the source indicator
+                // This allows the source indicator to handle the click itself
+                if (this._sourceIndicator.vfunc_button_press_event || this._sourceIndicator.emit) {
+                    return this._forwardClickToSource();
+                }
+            }
+
+            return Clutter.EVENT_PROPAGATE;
+        }
+
+        _isClipboardIndicator() {
+            const role = this._role ? this._role.toLowerCase() : '';
+            if (role.includes('clipboard') || role.includes('clipman'))
+                return true;
+
+            return !!(this._sourceIndicator?.registry &&
+                this._sourceIndicator?.clipItemsRadioGroup &&
+                typeof this._sourceIndicator?._toggleMenu === 'function');
+        }
+
+        _openQuickSettingsMenu() {
+            const menu = this._sourceIndicator?.menu;
+            if (!menu || menu.isOpen === undefined)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (this._quickSettingsMenuRestoreId) {
+                GLib.source_remove(this._quickSettingsMenuRestoreId);
+                this._quickSettingsMenuRestoreId = 0;
+            }
+            if (this._quickSettingsMenuPendingRestore) {
+                this._quickSettingsMenuPendingRestore();
+                this._quickSettingsMenuPendingRestore = null;
+            }
+
+            if (menu.isOpen)
+                return this._openQuickSettingsMirroredMenu();
+
+            if (!this._quickSettingsMenuPrimed)
+                return this._primeQuickSettingsMenuThenOpen();
+
+            return this._openQuickSettingsMirroredMenu();
+        }
+
+        _openQuickSettingsMirroredMenu() {
+            const monitorIndex = Main.layoutManager.findIndexForActor(this);
+            const menu = this._sourceIndicator?.menu;
+            if (!menu)
+                return Clutter.EVENT_PROPAGATE;
+
+            const originalSourceActor = menu.sourceActor;
+            const originalBoxPointer = menu.box?._sourceActor;
+            const originalSetActive = this._sourceIndicator.setActive?.bind(this._sourceIndicator);
+            const originalAddPseudoClass = this._sourceIndicator.add_style_pseudo_class?.bind(this._sourceIndicator);
+            let menuBoxState = null;
+            let openStateId = 0;
+            let restored = false;
+
+            const keepAnchoredToMirror = () => {
+                menu.sourceActor = this;
+                for (const actor of [menu.box, menu._boxPointer]) {
+                    if (!actor)
+                        continue;
+
+                    actor._sourceActor = this;
+                    actor._sourceAllocation = null;
+                }
+            };
+
+            const restoreMenuBox = () => {
+                if (!menuBoxState?.menuBox)
+                    return;
+
+                if (menuBoxState.originalSetPosition)
+                    menuBoxState.menuBox.setPosition = menuBoxState.originalSetPosition;
+                else
+                    delete menuBoxState.menuBox.setPosition;
+
+                if (menuBoxState.removedConstraints?.length > 0) {
+                    menuBoxState.removedConstraints.forEach(constraint => {
+                        menuBoxState.menuBox.add_constraint(constraint);
+                    });
+                }
+            };
+
+            const restoreSourceActor = () => {
+                menu.sourceActor = originalSourceActor;
+                if (menu.box)
+                    menu.box._sourceActor = originalBoxPointer;
+
+                if (menuBoxState?.sourceActorState) {
+                    for (const state of menuBoxState.sourceActorState) {
+                        state.actor._sourceActor = state.sourceActor;
+                        state.actor._sourceAllocation = state.sourceAllocation;
+                    }
+                }
+
+                this._clearSourceIndicatorActiveState();
+                this._quickSettingsMenuRestoreId = 0;
+                this._quickSettingsMenuPendingRestore = null;
+                return GLib.SOURCE_REMOVE;
+            };
+
+            const restoreAfterClose = () => {
+                if (restored)
+                    return;
+                restored = true;
+
+                if (openStateId) {
+                    menu.disconnect(openStateId);
+                    openStateId = 0;
+                }
+
+                if (originalSetActive)
+                    this._sourceIndicator.setActive = originalSetActive;
+                if (originalAddPseudoClass)
+                    this._sourceIndicator.add_style_pseudo_class = originalAddPseudoClass;
+
+                restoreMenuBox();
+                this.remove_style_pseudo_class('active');
+                this.remove_style_pseudo_class('checked');
+                this._clearSourceIndicatorActiveState();
+
+                if (this._quickSettingsMenuRestoreId)
+                    GLib.source_remove(this._quickSettingsMenuRestoreId);
+
+                keepAnchoredToMirror();
+                this._quickSettingsMenuPendingRestore = restoreSourceActor;
+                this._quickSettingsMenuRestoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, restoreSourceActor);
+            };
+
+            if (menu.isOpen) {
+                keepAnchoredToMirror();
+                openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                    if (!isOpen)
+                        restoreAfterClose();
+                });
+                menu.close();
+                return Clutter.EVENT_STOP;
+            }
+
+            this._preventMainPanelActiveState(originalAddPseudoClass);
+            this.add_style_pseudo_class('active');
+            keepAnchoredToMirror();
+
+            if (menu.box)
+                menuBoxState = this._updateMenuPositioning(menu, monitorIndex);
+
+            openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                if (isOpen) {
+                    this.add_style_pseudo_class('active');
+                    this._clearSourceIndicatorActiveState();
+                    return;
+                }
+
+                restoreAfterClose();
+            });
+
+            menu.open();
+
+            if (!menu.isOpen)
+                restoreAfterClose();
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _primeQuickSettingsMenuThenOpen() {
+            const menu = this._sourceIndicator?.menu;
+            if (!menu || this._quickSettingsPrimeId)
+                return Clutter.EVENT_STOP;
+
+            const actors = this._getQuickSettingsMenuActors(menu);
+            const actorState = actors.map(actor => ({
+                actor,
+                opacity: actor.opacity,
+            }));
+
+            const sourceActorState = [];
+            const originalSourceActor = menu.sourceActor;
+            const originalBoxPointer = menu.box?._sourceActor;
+            const primeSourceActor = originalSourceActor || this._sourceIndicator;
+            const noAnimation = BoxPointer.PopupAnimation?.NONE ?? 0;
+
+            for (const actor of [menu.box, menu._boxPointer]) {
+                if (!actor)
+                    continue;
+
+                sourceActorState.push({
+                    actor,
+                    sourceActor: actor._sourceActor,
+                    sourceAllocation: actor._sourceAllocation,
+                });
+            }
+
+            const restore = () => {
+                for (const state of actorState)
+                    state.actor.opacity = state.opacity;
+
+                menu.sourceActor = originalSourceActor;
+                if (menu.box)
+                    menu.box._sourceActor = originalBoxPointer;
+
+                for (const state of sourceActorState) {
+                    state.actor._sourceActor = state.sourceActor;
+                    state.actor._sourceAllocation = state.sourceAllocation;
+                }
+
+                this._clearSourceIndicatorActiveState();
+                this._quickSettingsPrimeRestore = null;
+            };
+
+            this._quickSettingsPrimeRestore = restore;
+
+            for (const actor of actors)
+                actor.opacity = 0;
+
+            menu.sourceActor = primeSourceActor;
+            for (const actor of [menu.box, menu._boxPointer]) {
+                if (!actor)
+                    continue;
+                actor._sourceActor = primeSourceActor;
+                actor._sourceAllocation = null;
+            }
+
+            menu.open(noAnimation);
+
+            this._quickSettingsPrimeId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 75, () => {
+                this._quickSettingsPrimeId = 0;
+
+                if (menu.isOpen)
+                    menu.close(noAnimation);
+
+                restore();
+                this._quickSettingsMenuPrimed = true;
+
+                this._quickSettingsOpenAfterPrimeId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                    this._quickSettingsOpenAfterPrimeId = 0;
+                    if (this._sourceIndicator)
+                        this._openQuickSettingsMirroredMenu();
+                    return GLib.SOURCE_REMOVE;
+                });
+
+                return GLib.SOURCE_REMOVE;
+            });
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _getQuickSettingsMenuActors(menu) {
+            const actors = [];
+            for (const actor of [menu.actor, menu.box, menu._boxPointer]) {
+                if (actor && !actors.includes(actor))
+                    actors.push(actor);
+            }
+            return actors;
+        }
+
+        _isClipboardMenuReady() {
+            if (!this._isClipboardIndicator())
+                return true;
+
+            return !!(this._sourceIndicator?.searchEntry ||
+                this._sourceIndicator?.privateModeMenuItem ||
+                this._sourceIndicator?.emptyStateSection);
+        }
+
+        _clearSourceIndicatorActiveState() {
+            for (const actor of [this._sourceIndicator, this._sourceIndicator?.container]) {
+                if (!actor)
+                    continue;
+
+                actor.remove_style_pseudo_class('active');
+                actor.remove_style_pseudo_class('checked');
+            }
+        }
+
+        _activateWorkspacePreviewAt(event) {
+            if (this._workspacePreviewButtons?.length > 0) {
+                const [stageX, stageY] = event.get_coords();
+
+                for (const previewButton of this._workspacePreviewButtons) {
+                    const [buttonX, buttonY] = previewButton.get_transformed_position();
+                    const [buttonWidth, buttonHeight] = previewButton.get_transformed_size();
+
+                    if (stageX >= buttonX && stageX <= buttonX + buttonWidth &&
+                        stageY >= buttonY && stageY <= buttonY + buttonHeight) {
+                        const workspace = global.workspace_manager.get_workspace_by_index(
+                            previewButton._mmWorkspaceIndex);
+                        workspace?.activate(event.get_time());
+                        return true;
+                    }
+                }
+            }
+
+            const thumbnailsBox = this._sourceIndicator?._thumbnails?._thumbnailsBox;
+            const sourceChild = this._sourceIndicator?.get_first_child();
+            if (!thumbnailsBox || !sourceChild || !event)
+                return false;
+
+            const previews = thumbnailsBox.get_children();
+            if (previews.length === 0)
+                return false;
+
+            const [stageX] = event.get_coords();
+            const [mirrorX] = this.get_transformed_position();
+            const [mirrorWidth] = this.get_transformed_size();
+            const [sourceX] = sourceChild.get_transformed_position();
+            const [sourceWidth] = sourceChild.get_transformed_size();
+
+            if (mirrorWidth <= 0 || sourceWidth <= 0)
+                return false;
+
+            const sourceLocalX = ((stageX - mirrorX) / mirrorWidth) * sourceWidth;
+
+            for (let i = 0; i < previews.length; i++) {
+                const preview = previews[i];
+                if (!preview.visible)
+                    continue;
+
+                const [previewX] = preview.get_transformed_position();
+                const [previewWidth] = preview.get_transformed_size();
+                const previewLocalX = previewX - sourceX;
+
+                if (sourceLocalX >= previewLocalX &&
+                    sourceLocalX <= previewLocalX + previewWidth) {
+                    const workspace = global.workspace_manager.get_workspace_by_index(i);
+                    workspace?.activate(event.get_time());
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        _forwardClickToSource() {
+            // Forward the click to the source indicator
+            // This makes the source indicator handle the click as if it was clicked directly
+            this.add_style_pseudo_class('active');
+
+            // Emit button-press-event on the source
+            const event = Clutter.get_current_event();
+            if (event && this._sourceIndicator.emit) {
+                this._sourceIndicator.emit('button-press-event', event);
+            }
+
+            // Also try button-release-event which some extensions use
+            if (event && this._sourceIndicator.emit) {
+                // Clean up any existing timeout before creating a new one
+                if (this._forwardClickTimeoutId) {
+                    GLib.source_remove(this._forwardClickTimeoutId);
+                    this._forwardClickTimeoutId = null;
+                }
+                this._forwardClickTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                    this._sourceIndicator.emit('button-release-event', event);
+                    this.remove_style_pseudo_class('active');
+                    this._forwardClickTimeoutId = null;
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _openArcMenu() {
+            // Find ArcMenu's internal menu object
+            let arcMenu = null;
+            let toggleFunc = null;
+
+            if (this._sourceIndicator.arcMenu) {
+                arcMenu = this._sourceIndicator.arcMenu;
+                toggleFunc = () => this._sourceIndicator.arcMenu.toggle();
+            } else if (this._sourceIndicator._menuButton?.arcMenu) {
+                arcMenu = this._sourceIndicator._menuButton.arcMenu;
+                toggleFunc = () => this._sourceIndicator._menuButton.toggleMenu();
+            } else if (typeof this._sourceIndicator.toggleMenu === 'function') {
+                // Try to find arcMenu property on the indicator
+                arcMenu = this._sourceIndicator.arcMenu || this._sourceIndicator.menu;
+                toggleFunc = () => this._sourceIndicator.toggleMenu();
+            }
+            if (arcMenu && !toggleFunc && typeof arcMenu.toggle === 'function')
+                toggleFunc = () => arcMenu.toggle();
+
+            // If we found a menu, anchor it to the mirrored button on this
+            // monitor, using the same BoxPointer override as normal menus.
+            if (arcMenu && arcMenu.sourceActor) {
+                const monitorIndex = Main.layoutManager.findIndexForActor(this);
+                const originalSourceActor = arcMenu.sourceActor;
+                const originalBoxPointer = arcMenu.box?._sourceActor;
+                const originalSetActive = this._sourceIndicator.setActive?.bind(this._sourceIndicator);
+                const originalAddPseudoClass = this._sourceIndicator.add_style_pseudo_class?.bind(this._sourceIndicator);
+                let menuBoxState = null;
+
+                if (arcMenu.isOpen) {
+                    arcMenu.close();
+                    return Clutter.EVENT_STOP;
+                }
+
+                // Prevent active state on main panel indicator
+                this._preventMainPanelActiveState(originalAddPseudoClass);
+
+                // Add active style to THIS button
+                this.add_style_pseudo_class('active');
+
+                // Temporarily change sourceActor to this button for positioning
+                arcMenu.sourceActor = this;
+
+                if (arcMenu.box) {
+                    menuBoxState = this._updateMenuPositioning(arcMenu, monitorIndex);
+                }
+
+                // Connect to menu close to restore state
+                const openStateId = arcMenu.connect('open-state-changed', (_m, isOpen) => {
+                    if (isOpen) {
+                        this.add_style_pseudo_class('active');
+                        return;
+                    }
+
+                    if (!isOpen) {
+                        this._restoreMenuState(arcMenu, originalSourceActor, originalBoxPointer,
+                            originalSetActive, originalAddPseudoClass, menuBoxState);
+                        arcMenu.disconnect(openStateId);
+                    }
+                });
+
+                // Toggle the menu
+                if (toggleFunc) {
+                    toggleFunc();
+                } else {
+                    this._restoreMenuState(arcMenu, originalSourceActor, originalBoxPointer,
+                        originalSetActive, originalAddPseudoClass, menuBoxState);
+                }
+            } else {
+                // Fallback: just toggle without repositioning
+                this.add_style_pseudo_class('active');
+
+                if (typeof this._sourceIndicator.toggleMenu === 'function') {
+                    this._sourceIndicator.toggleMenu();
+                } else if (this._sourceIndicator.arcMenu?.toggle) {
+                    this._sourceIndicator.arcMenu.toggle();
+                } else if (this._sourceIndicator._menuButton?.toggleMenu) {
+                    this._sourceIndicator._menuButton.toggleMenu();
+                }
+
+                // Clean up active state after a short delay
+                if (this._arcMenuTimeoutId) {
+                    GLib.source_remove(this._arcMenuTimeoutId);
+                    this._arcMenuTimeoutId = null;
+                }
+                this._arcMenuTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                    this.remove_style_pseudo_class('active');
+                    this._arcMenuTimeoutId = null;
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _openClipboardIndicatorMenu() {
+            const menu = this._sourceIndicator.menu;
+            if (!menu || menu.isOpen === undefined)
+                return Clutter.EVENT_PROPAGATE;
+
+            if (!this._isClipboardMenuReady()) {
+                if (!this._clipboardOpenRetries)
+                    this._clipboardOpenRetries = 0;
+
+                if (this._clipboardOpenRetries < 20) {
+                    this._clipboardOpenRetries++;
+                    this.add_style_pseudo_class('active');
+                    if (this._clipboardOpenRetryId)
+                        GLib.source_remove(this._clipboardOpenRetryId);
+                    this._clipboardOpenRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                        this._clipboardOpenRetryId = 0;
+                        this._openClipboardIndicatorMenu();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return Clutter.EVENT_STOP;
+                }
+            }
+
+            this._clipboardOpenRetries = 0;
+            if (this._clipboardOpenRetryId) {
+                GLib.source_remove(this._clipboardOpenRetryId);
+                this._clipboardOpenRetryId = 0;
+            }
+
+            if (menu.isOpen) {
+                menu.close();
+                return Clutter.EVENT_STOP;
+            }
+
+            const originalSourceActor = menu.sourceActor;
+            const originalBoxPointer = menu.box?._sourceActor;
+            let openStateId = 0;
+            const sourceActorState = [];
+
+            this.add_style_pseudo_class('active');
+            menu.sourceActor = this;
+
+            for (const actor of [menu.box, menu._boxPointer]) {
+                if (!actor)
+                    continue;
+
+                sourceActorState.push({
+                    actor,
+                    sourceActor: actor._sourceActor,
+                    sourceAllocation: actor._sourceAllocation,
+                });
+                actor._sourceActor = this;
+                actor._sourceAllocation = null;
+            }
+
+            const restore = (deferSourceRestore = false) => {
+                const restoreSourceActor = () => {
+                    menu.sourceActor = originalSourceActor;
+                    if (menu.box)
+                        menu.box._sourceActor = originalBoxPointer;
+
+                    for (const state of sourceActorState) {
+                        state.actor._sourceActor = state.sourceActor;
+                        state.actor._sourceAllocation = state.sourceAllocation;
+                    }
+
+                    this._clipboardSourceRestoreId = 0;
+                    this._clipboardPendingSourceRestore = null;
+                    return GLib.SOURCE_REMOVE;
+                };
+
+                this.remove_style_pseudo_class('active');
+                this.remove_style_pseudo_class('checked');
+
+                this._clearSourceIndicatorActiveState();
+                if (this._clipboardActiveCleanupId) {
+                    GLib.source_remove(this._clipboardActiveCleanupId);
+                    this._clipboardActiveCleanupId = 0;
+                }
+
+                if (openStateId) {
+                    menu.disconnect(openStateId);
+                    openStateId = 0;
+                }
+
+                if (this._clipboardSourceRestoreId) {
+                    GLib.source_remove(this._clipboardSourceRestoreId);
+                    this._clipboardSourceRestoreId = 0;
+                }
+
+                if (deferSourceRestore) {
+                    menu.sourceActor = this;
+                    if (menu.box)
+                        menu.box._sourceActor = this;
+                    for (const state of sourceActorState) {
+                        state.actor._sourceActor = this;
+                        state.actor._sourceAllocation = null;
+                    }
+
+                    this._clipboardPendingSourceRestore = restoreSourceActor;
+                    this._clipboardSourceRestoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, restoreSourceActor);
+                } else {
+                    restoreSourceActor();
+                }
+            };
+
+            openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                if (isOpen) {
+                    this.add_style_pseudo_class('active');
+                    this._clearSourceIndicatorActiveState();
+                    if (this._clipboardActiveCleanupId)
+                        GLib.source_remove(this._clipboardActiveCleanupId);
+                    this._clipboardActiveCleanupId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                        this._clearSourceIndicatorActiveState();
+                        this._clipboardActiveCleanupId = 0;
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return;
+                }
+
+                restore(true);
+            });
+
+            if (typeof this._sourceIndicator._toggleMenu === 'function')
+                this._sourceIndicator._toggleMenu();
+            else
+                menu.toggle();
+
+            if (!menu.isOpen)
+                restore();
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _openCustomPopupMenu(popupMenu) {
+            const monitorIndex = Main.layoutManager.findIndexForActor(this);
+            const originalSourceActor = popupMenu.sourceActor;
+
+            // Close the menu if it's already open
+            if (popupMenu.isOpen) {
+                popupMenu.close();
+                return Clutter.EVENT_STOP;
+            }
+
+            // Add active style to this button
+            this.add_style_pseudo_class('active');
+
+            // Update popup's sourceActor to position correctly
+            popupMenu.sourceActor = this;
+
+            // Update positioning for the correct monitor
+            if (popupMenu.box) {
+                const monitor = Main.layoutManager.monitors[monitorIndex];
+                if (monitor && popupMenu.box._updateFlip) {
+                    popupMenu.box._updateFlip(monitor);
+                }
+            }
+
+            // Setup cleanup on menu close
+            const openStateId = popupMenu.connect('open-state-changed', (_m, isOpen) => {
+                if (isOpen) {
+                    this.add_style_pseudo_class('active');
+                } else {
+                    this.remove_style_pseudo_class('active');
+                    popupMenu.sourceActor = originalSourceActor;
+                    popupMenu.disconnect(openStateId);
+                }
+            });
+
+            popupMenu.open();
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _openWorkspaceIndicatorMenu() {
+            const monitorIndex = Main.layoutManager.findIndexForActor(this);
+            const menu = this._sourceIndicator?.menu;
+            if (!menu)
+                return Clutter.EVENT_PROPAGATE;
+
+            const originalSourceActor = menu.sourceActor;
+            const originalBoxPointer = menu.box?._sourceActor;
+            const originalSetActive = this._sourceIndicator.setActive?.bind(this._sourceIndicator);
+            const originalAddPseudoClass = this._sourceIndicator.add_style_pseudo_class?.bind(this._sourceIndicator);
+            let menuBoxState = null;
+            let openStateId = 0;
+            let restored = false;
+
+            const keepAnchoredToMirror = () => {
+                menu.sourceActor = this;
+                for (const actor of [menu.box, menu._boxPointer]) {
+                    if (!actor)
+                        continue;
+                    actor._sourceActor = this;
+                    actor._sourceAllocation = null;
+                }
+            };
+
+            const restoreMenuBox = () => {
+                if (!menuBoxState?.menuBox)
+                    return;
+
+                if (menuBoxState.originalSetPosition)
+                    menuBoxState.menuBox.setPosition = menuBoxState.originalSetPosition;
+                else
+                    delete menuBoxState.menuBox.setPosition;
+
+                if (menuBoxState.removedConstraints?.length > 0) {
+                    menuBoxState.removedConstraints.forEach(constraint => {
+                        menuBoxState.menuBox.add_constraint(constraint);
+                    });
+                }
+            };
+
+            const restoreSourceActor = () => {
+                if (originalSourceActor)
+                    menu.sourceActor = originalSourceActor;
+                if (menu.box && originalBoxPointer)
+                    menu.box._sourceActor = originalBoxPointer;
+                if (menuBoxState?.sourceActorState) {
+                    for (const state of menuBoxState.sourceActorState) {
+                        state.actor._sourceActor = state.sourceActor;
+                        state.actor._sourceAllocation = state.sourceAllocation;
+                    }
+                }
+
+                this._clearSourceIndicatorActiveState();
+                this._workspaceMenuRestoreId = 0;
+                this._workspaceMenuPendingRestore = null;
+                return GLib.SOURCE_REMOVE;
+            };
+
+            const restoreAfterClose = () => {
+                if (restored)
+                    return;
+                restored = true;
+
+                if (openStateId) {
+                    menu.disconnect(openStateId);
+                    openStateId = 0;
+                }
+
+                if (originalSetActive)
+                    this._sourceIndicator.setActive = originalSetActive;
+                if (originalAddPseudoClass)
+                    this._sourceIndicator.add_style_pseudo_class = originalAddPseudoClass;
+
+                restoreMenuBox();
+                this.remove_style_pseudo_class('active');
+                this.remove_style_pseudo_class('checked');
+                this._clearSourceIndicatorActiveState();
+
+                if (this._workspaceMenuRestoreId)
+                    GLib.source_remove(this._workspaceMenuRestoreId);
+
+                // The menu close animation can still query sourceActor. Keep it
+                // anchored to this mirror briefly so the primary panel button
+                // does not flash active during/after close.
+                keepAnchoredToMirror();
+                this._workspaceMenuPendingRestore = restoreSourceActor;
+                this._workspaceMenuRestoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, restoreSourceActor);
+            };
+
+            if (menu.isOpen) {
+                keepAnchoredToMirror();
+                if (originalSourceActor !== this) {
+                    openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                        if (!isOpen)
+                            restoreAfterClose();
+                    });
+                }
+                menu.close();
+                return Clutter.EVENT_STOP;
+            }
+
+            this._preventMainPanelActiveState(originalAddPseudoClass);
+            this.add_style_pseudo_class('active');
+            keepAnchoredToMirror();
+
+            if (menu.box)
+                menuBoxState = this._updateMenuPositioningNative(menu);
+
+            openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                if (isOpen) {
+                    this.add_style_pseudo_class('active');
+                    this._clearSourceIndicatorActiveState();
+                    return;
+                }
+
+                restoreAfterClose();
+            });
+
+            menu.open();
+
+            if (!menu.isOpen)
+                restoreAfterClose();
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _openMirroredMenu() {
+            const menu = this._sourceIndicator.menu;
+
+            if (this._genericMenuRestoreId) {
+                GLib.source_remove(this._genericMenuRestoreId);
+                this._genericMenuRestoreId = 0;
+            }
+            if (this._genericMenuPendingRestore) {
+                this._genericMenuPendingRestore();
+                this._genericMenuPendingRestore = null;
+            }
+
+            // Store original state variables
+            let originalSourceActor = menu.sourceActor;
+            let originalBoxPointer = menu.box?._sourceActor;
+            let originalSetActive = this._sourceIndicator.setActive?.bind(this._sourceIndicator);
+            let originalAddPseudoClass = this._sourceIndicator.add_style_pseudo_class?.bind(this._sourceIndicator);
+
+            // State for restoring menu box modifications
+            let menuBoxState = null;
+
+            let openStateId = 0;
+            let restored = false;
+
+            const keepAnchoredToMirror = () => {
+                menu.sourceActor = this;
+                for (const actor of [menu.box, menu._boxPointer]) {
+                    if (!actor)
+                        continue;
+
+                    actor._sourceActor = this;
+                    actor._sourceAllocation = null;
+                }
+            };
+
+            const restoreSourceActor = () => {
+                menu.sourceActor = originalSourceActor;
+                if (menu.box)
+                    menu.box._sourceActor = originalBoxPointer;
+
+                if (menuBoxState?.sourceActorState) {
+                    for (const state of menuBoxState.sourceActorState) {
+                        state.actor._sourceActor = state.sourceActor;
+                        state.actor._sourceAllocation = state.sourceAllocation;
+                    }
+                }
+
+                this._genericMenuRestoreId = 0;
+                this._genericMenuPendingRestore = null;
+                return GLib.SOURCE_REMOVE;
+            };
+
+            const restoreAfterClose = () => {
+                if (restored)
+                    return;
+                restored = true;
+
+                if (openStateId) {
+                    menu.disconnect(openStateId);
+                    openStateId = 0;
+                }
+
+                if (originalSetActive)
+                    this._sourceIndicator.setActive = originalSetActive;
+                if (originalAddPseudoClass)
+                    this._sourceIndicator.add_style_pseudo_class = originalAddPseudoClass;
+
+                this.remove_style_pseudo_class('active');
+                this.remove_style_pseudo_class('checked');
+                this._clearSourceIndicatorActiveState();
+
+                if (this._genericMenuRestoreId)
+                    GLib.source_remove(this._genericMenuRestoreId);
+
+                keepAnchoredToMirror();
+                this._genericMenuPendingRestore = restoreSourceActor;
+                this._genericMenuRestoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, restoreSourceActor);
+            };
+
+            if (menu.isOpen) {
+                keepAnchoredToMirror();
+                openStateId = menu.connect('open-state-changed', (_m, isOpen) => {
+                    if (!isOpen)
+                        restoreAfterClose();
+                });
+                menu.close();
+                return Clutter.EVENT_STOP;
+            }
+
+            // Prevent active state on main panel indicator
+            this._preventMainPanelActiveState(originalAddPseudoClass);
+
+            // Add active style to THIS button
+            this.add_style_pseudo_class('active');
+
+            keepAnchoredToMirror();
+
+            // Update BoxPointer positioning and save state for restoration.
+            // Native variant trusts BoxPointer._reposition() so freshly-built
+            // mirrors (e.g., Tiling Shell) open the menu on the first click
+            // without needing the source button to be primed first.
+            if (menu.box) {
+                menuBoxState = this._updateMenuPositioningNative(menu);
+            }
+
+            // Setup cleanup on menu close
+            openStateId = menu.connect('open-state-changed', (m, isOpen) => {
+                if (isOpen) {
+                    this.add_style_pseudo_class('active');
+                    this._clearSourceIndicatorActiveState();
+                } else {
+                    restoreAfterClose();
+                }
+            });
+
+            menu.open();
+
+            if (!menu.isOpen)
+                restoreAfterClose();
+
+            return Clutter.EVENT_STOP;
+        }
+
+        _preventMainPanelActiveState(originalAddPseudoClass) {
+            if (this._sourceIndicator.setActive) {
+                this._sourceIndicator.setActive = () => { };
+            }
+
+            if (this._sourceIndicator.add_style_pseudo_class) {
+                const originalMethod = this._sourceIndicator.add_style_pseudo_class.bind(this._sourceIndicator);
+                this._sourceIndicator.add_style_pseudo_class = (pseudoClass) => {
+                    if (pseudoClass !== 'active' && pseudoClass !== 'checked') {
+                        originalMethod(pseudoClass);
+                    }
+                };
+            }
+
+            if (this._sourceIndicator.remove_style_pseudo_class) {
+                this._sourceIndicator.remove_style_pseudo_class('active');
+                this._sourceIndicator.remove_style_pseudo_class('checked');
+            }
+        }
+
+        _updateMenuPositioning(menu, monitorIndex, sourceActor = this) {
+            const menuBox = menu._boxPointer || menu.box;
+            if (!menuBox)
+                return null;
+
+            // 1. Save original source actor
+            const sourceActorState = [];
+            for (const actor of [menu.box, menu._boxPointer]) {
+                if (!actor)
+                    continue;
+
+                sourceActorState.push({
+                    actor,
+                    sourceActor: actor._sourceActor,
+                    sourceAllocation: actor._sourceAllocation,
+                });
+                actor._sourceActor = sourceActor;
+                actor._sourceAllocation = null;
+            }
+
+            // 2. Handle constraints
+            const removedConstraints = [];
+            const constraints = menuBox.get_constraints ? menuBox.get_constraints() : [];
+            for (let constraint of constraints) {
+                if (constraint.constructor.name === 'BindConstraint' ||
+                    constraint.constructor.name === 'AlignConstraint') {
+                    menuBox.remove_constraint(constraint);
+                    removedConstraints.push(constraint);
+                }
+            }
+
+            // 3. Handle setPosition override - FULL MANUAL REPLACEMENT
+            // We do NOT call oldSetPosition because it likely crashes/fails on extended monitors
+            const originalSetPosition = menuBox.setPosition;
+
+            const monitor = Main.layoutManager.monitors[monitorIndex] || Main.layoutManager.primaryMonitor;
+
+            menuBox.setPosition = function (sourceActor, alignment) {
+                // Calculate position manually
+                const [btnX, btnY] = sourceActor.get_transformed_position();
+                const [btnW, btnH] = sourceActor.get_transformed_size();
+                const prefW = this.get_preferred_width(-1);
+                const prefH = this.get_preferred_height(-1);
+                const finalMenuW = prefW[1]; // Use natural width
+                // Height might be dynamic, use current size or preferred?
+                // BoxPointer usually has size by now.
+                const [currW, currH] = this.get_size();
+                const finalMenuH = currH > 0 ? currH : prefH[1];
+
+                // Center horizontally on the button
+                let newX = btnX + (btnW / 2) - (finalMenuW / 2);
+                let newY = btnY + btnH; // Below the button
+
+                // Constraint to monitor bounds
+                if (newX + finalMenuW > monitor.x + monitor.width) {
+                    newX = monitor.x + monitor.width - finalMenuW;
+                }
+                if (newX < monitor.x) {
+                    newX = monitor.x;
+                }
+
+                // Vertical constraint (flip if needed, though usually bar is top)
+                if (newY + finalMenuH > monitor.y + monitor.height) {
+                    newY = btnY - finalMenuH;
+                    if (this.setArrowSide) this.setArrowSide(St.Side.BOTTOM);
+                } else {
+                    if (this.setArrowSide) this.setArrowSide(St.Side.TOP);
+                }
+
+                this.set_position(Math.round(newX), Math.round(newY));
+            };
+
+            return {
+                menuBox,
+                originalSetPosition,
+                removedConstraints,
+                sourceActorState,
+            };
+        }
+
+        // Variant of _updateMenuPositioning that trusts BoxPointer's built-in
+        // _reposition() (called from vfunc_allocate). The manual setPosition
+        // override above reads get_preferred_width(-1) which returns 0 the
+        // first time a menu is opened from a freshly-built mirror — before
+        // the boxpointer has ever been allocated — so the very first click
+        // appears to do nothing. _reposition handles extended monitors via
+        // Main.layoutManager.findIndexForActor() and uses the box's actual
+        // size at allocate time, so it doesn't have that timing dependency.
+        _updateMenuPositioningNative(menu, sourceActor = this) {
+            const menuBox = menu._boxPointer || menu.box;
+            if (!menuBox)
+                return null;
+
+            const sourceActorState = [];
+            for (const actor of [menu.box, menu._boxPointer]) {
+                if (!actor)
+                    continue;
+
+                sourceActorState.push({
+                    actor,
+                    sourceActor: actor._sourceActor,
+                    sourceAllocation: actor._sourceAllocation,
+                });
+                actor._sourceActor = sourceActor;
+                actor._sourceAllocation = null;
+            }
+
+            menuBox.queue_relayout();
+
+            return {
+                menuBox,
+                sourceActorState,
+            };
+        }
+
+        _restoreMenuState(menu, originalSourceActor, originalBoxPointer, originalSetActive, originalAddPseudoClass, menuBoxState) {
+            // 1. Restore standard menu properties
+            if (originalSourceActor) {
+                menu.sourceActor = originalSourceActor;
+            }
+
+            if (menu.box && originalBoxPointer) {
+                menu.box._sourceActor = originalBoxPointer;
+            }
+            if (menuBoxState?.sourceActorState) {
+                for (const state of menuBoxState.sourceActorState) {
+                    state.actor._sourceActor = state.sourceActor;
+                    state.actor._sourceAllocation = state.sourceAllocation;
+                }
+            }
+
+            // 2. Restore hijacked indicator methods
+            if (originalSetActive && this._sourceIndicator) {
+                this._sourceIndicator.setActive = originalSetActive;
+            }
+
+            if (originalAddPseudoClass && this._sourceIndicator) {
+                this._sourceIndicator.add_style_pseudo_class = originalAddPseudoClass;
+            }
+
+            // 3. Restore menu box modifications (setPosition and constraints)
+            if (menuBoxState?.menuBox) {
+                if (menuBoxState.originalSetPosition)
+                    menuBoxState.menuBox.setPosition = menuBoxState.originalSetPosition;
+                else
+                    delete menuBoxState.menuBox.setPosition;
+
+                if (menuBoxState.removedConstraints && menuBoxState.removedConstraints.length > 0) {
+                    menuBoxState.removedConstraints.forEach(constraint => {
+                        menuBoxState.menuBox.add_constraint(constraint);
+                    });
+                }
+            }
+
+            // 4. Reset style classes on source
+            if (this._sourceIndicator && this._sourceIndicator.remove_style_pseudo_class) {
+                this._sourceIndicator.remove_style_pseudo_class('active');
+                this._sourceIndicator.remove_style_pseudo_class('checked');
+            }
+
+            // Always try to reset this button's state
+            if (this.remove_style_pseudo_class) {
+                this.remove_style_pseudo_class('active');
+                this.remove_style_pseudo_class('checked');
+            }
+        }
+
+        _cleanup() {
+            for (const { child, proxy, visId } of this._astraProxyConnections ?? []) {
+                child.disconnect(visId);
+                this._unregisterAstraTooltipProxy(proxy, child);
+                child._mmp_proxyHovering = false;
+            }
+            this._astraProxyConnections = null;
+            this._disconnectMirroredClockDisplay();
+            this._disconnectLabelCopyBindings();
+            this._disconnectIconSyncSource();
+
+            if (this._forwardClickTimeoutId) {
+                GLib.source_remove(this._forwardClickTimeoutId);
+                this._forwardClickTimeoutId = null;
+            }
+
+            if (this._iconSyncId) {
+                GLib.source_remove(this._iconSyncId);
+                this._iconSyncId = null;
+            }
+
+            if (this._arcMenuTimeoutId) {
+                GLib.source_remove(this._arcMenuTimeoutId);
+                this._arcMenuTimeoutId = null;
+            }
+
+            if (this._clipboardOpenRetryId) {
+                GLib.source_remove(this._clipboardOpenRetryId);
+                this._clipboardOpenRetryId = null;
+            }
+
+            if (this._clipboardActiveCleanupId) {
+                GLib.source_remove(this._clipboardActiveCleanupId);
+                this._clipboardActiveCleanupId = null;
+            }
+
+            if (this._clipboardSourceRestoreId) {
+                GLib.source_remove(this._clipboardSourceRestoreId);
+                this._clipboardSourceRestoreId = null;
+            }
+            if (this._clipboardPendingSourceRestore) {
+                this._clipboardPendingSourceRestore();
+                this._clipboardPendingSourceRestore = null;
+            }
+
+            if (this._lockSizeTimeoutId) {
+                GLib.source_remove(this._lockSizeTimeoutId);
+                this._lockSizeTimeoutId = null;
+            }
+
+            if (this._monitorTimeoutId) {
+                GLib.source_remove(this._monitorTimeoutId);
+                this._monitorTimeoutId = null;
+            }
+
+            if (this._qsInitialSyncId) {
+                GLib.source_remove(this._qsInitialSyncId);
+                this._qsInitialSyncId = null;
+            }
+
+            if (this._quickSettingsPrimeId) {
+                GLib.source_remove(this._quickSettingsPrimeId);
+                this._quickSettingsPrimeId = 0;
+            }
+
+            if (this._quickSettingsOpenAfterPrimeId) {
+                GLib.source_remove(this._quickSettingsOpenAfterPrimeId);
+                this._quickSettingsOpenAfterPrimeId = 0;
+            }
+
+            if (this._quickSettingsPrimeRestore) {
+                this._quickSettingsPrimeRestore();
+                this._quickSettingsPrimeRestore = null;
+            }
+
+            if (this._quickSettingsMenuRestoreId) {
+                GLib.source_remove(this._quickSettingsMenuRestoreId);
+                this._quickSettingsMenuRestoreId = 0;
+            }
+            if (this._quickSettingsMenuPendingRestore) {
+                this._quickSettingsMenuPendingRestore();
+                this._quickSettingsMenuPendingRestore = null;
+            }
+
+            if (this._astraMenuRestoreId) {
+                GLib.source_remove(this._astraMenuRestoreId);
+                this._astraMenuRestoreId = 0;
+            }
+            if (this._astraMenuPendingRestore) {
+                this._astraMenuPendingRestore();
+                this._astraMenuPendingRestore = null;
+            }
+
+            if (this._genericMenuRestoreId) {
+                GLib.source_remove(this._genericMenuRestoreId);
+                this._genericMenuRestoreId = 0;
+            }
+            if (this._genericMenuPendingRestore) {
+                this._genericMenuPendingRestore();
+                this._genericMenuPendingRestore = null;
+            }
+
+            if (this._overviewShowingId) {
+                Main.overview.disconnect(this._overviewShowingId);
+                this._overviewShowingId = null;
+            }
+
+            if (this._fullscreenChangedId) {
+                global.display.disconnect(this._fullscreenChangedId);
+                this._fullscreenChangedId = null;
+            }
+
+            if (this._sourceSizeChangedId && this._quickSettingsSource) {
+                this._quickSettingsSource.disconnect(this._sourceSizeChangedId);
+                this._sourceSizeChangedId = null;
+            }
+
+            if (this._sizeDebounceId) {
+                GLib.source_remove(this._sizeDebounceId);
+                this._sizeDebounceId = null;
+            }
+
+            if (this._workspaceIndicatorModeRebuildId) {
+                GLib.source_remove(this._workspaceIndicatorModeRebuildId);
+                this._workspaceIndicatorModeRebuildId = 0;
+            }
+
+            if (this._workspaceIndicatorModeWatchSource && this._workspaceIndicatorModeWatchId) {
+                this._workspaceIndicatorModeWatchSource.disconnect(this._workspaceIndicatorModeWatchId);
+                this._workspaceIndicatorModeWatchSource = null;
+                this._workspaceIndicatorModeWatchId = 0;
+            }
+
+            if (this._workspaceSourceMenuRegistered) {
+                this._panel?.menuManager?.removeMenu(this._workspaceSourceMenuRegistered);
+                this._workspaceSourceMenuRegistered = null;
+            }
+
+            if (this._workspaceNameLabelChangedId) {
+                this._sourceIndicator?.menu?.disconnect(this._workspaceNameLabelChangedId);
+                this._workspaceNameLabelChangedId = 0;
+            }
+            this._workspaceNameLabel = null;
+            this._workspaceNameStatusBox = null;
+
+            if (this._workspaceMenuRestoreId) {
+                GLib.source_remove(this._workspaceMenuRestoreId);
+                this._workspaceMenuRestoreId = 0;
+            }
+            if (this._workspaceMenuPendingRestore) {
+                this._workspaceMenuPendingRestore();
+                this._workspaceMenuPendingRestore = null;
+            }
+
+            if (this._workspacePreviewUpdateId) {
+                GLib.source_remove(this._workspacePreviewUpdateId);
+                this._workspacePreviewUpdateId = 0;
+            }
+
+            if (this._workspacePreviewSignalIds) {
+                for (const { object, id } of this._workspacePreviewSignalIds) {
+                    object.disconnect(id);
+                }
+                this._workspacePreviewSignalIds = null;
+            }
+
+            this._disconnectWorkspaceWindowSignals();
+
+            if (this._allocationCloneTimeouts) {
+                for (const timeoutId of this._allocationCloneTimeouts) {
+                    GLib.source_remove(timeoutId);
+                }
+                this._allocationCloneTimeouts = null;
+            }
+
+            if (this._allocationCloneSignals) {
+                for (const signal of this._allocationCloneSignals) {
+                    signal.source.disconnect(signal.id);
+                }
+                this._allocationCloneSignals = null;
+            }
+
+            for (const release of this._astraSourceSizeReleases ?? [])
+                release();
+            this._astraSourceSizeReleases = null;
+
+            // Source-presence handlers were connected with connectObject(this);
+            // GJS auto-disconnects them on destroy, but disconnect explicitly
+            // for the non-destroy cleanup path too.
+            this._releaseSourceButtons();
+            this._sourceIndicator?.disconnectObject(this);
+            this._sourceIndicator?.container?.disconnectObject(this);
+            this._sourcePresenceChild?.disconnectObject(this);
+            this._sourcePresenceChild = null;
+            this._sourcePresenceWatched = false;
+
+            if (this._role === 'activities') {
+                if (this._showingId) {
+                    Main.overview.disconnect(this._showingId);
+                    this._showingId = null;
+                }
+                if (this._hidingId) {
+                    Main.overview.disconnect(this._hidingId);
+                    this._hidingId = null;
+                }
+                if (this._activeWsChangedId) {
+                    this._workspaceManager.disconnect(this._activeWsChangedId);
+                    this._activeWsChangedId = null;
+                }
+                if (this._nWorkspacesChangedId) {
+                    this._workspaceManager.disconnect(this._nWorkspacesChangedId);
+                    this._nWorkspacesChangedId = null;
+                }
+            }
+
+            if (this._sourceDestroyId)
+                this._sourceIndicator?.disconnect(this._sourceDestroyId);
+            this._sourceDestroyId = 0;
+            this._quickSettingsSource = null;
+            this._quickSettingsClone = null;
+            this._sourceIndicator = null;
+            this._panel = null;
+            this._workspaceManager = null;
+        }
+
+        destroy() {
+            this._cleanup();
+            super.destroy();
+        }
+    });

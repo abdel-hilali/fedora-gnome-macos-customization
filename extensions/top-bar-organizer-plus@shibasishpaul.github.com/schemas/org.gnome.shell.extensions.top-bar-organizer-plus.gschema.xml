@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+    <schema id="org.gnome.shell.extensions.top-bar-organizer-plus" path="/org/gnome/shell/extensions/top-bar-organizer-plus/">
+        <key name="left-box-order" type="as">
+            <description>Order of items in the left box of the top bar.</description>
+            <default>[]</default>
+        </key>
+        <key name="center-box-order" type="as">
+            <description>Order of items in the center box of the top bar.</description>
+            <default>[]</default>
+        </key>
+        <key name="right-box-order" type="as">
+            <description>Order of items in the right box of the top bar.</description>
+            <default>[]</default>
+        </key>
+        <key name="family-order-task-up-ultralite" type="as">
+            <description>Order of Task Up UltraLite items within their group slot.</description>
+            <default>[]</default>
+        </key>
+        <key name="family-order-gsconnect" type="as">
+            <description>Order of GSConnect device items within their group slot.</description>
+            <default>[]</default>
+        </key>
+        <key name="family-order-tasks-in-panel" type="as">
+            <description>Order of Tasks in Panel items within their group slot.</description>
+            <default>[]</default>
+        </key>
+        <key name="item-creators" type="a{ss}">
+            <description>Persisted map of item role to the uuid of the extension that created it (or an empty string if confirmed to have no creator extension). Makes first-write-wins creator identification durable across restarts instead of re-deriving it, and closes the race window, every session.</description>
+            <default>{}</default>
+        </key>
+        <key name="hide" type="as">
+            <description>Top bar items to (forcefully) hide.</description>
+            <default>[]</default>
+        </key>
+        <key name="show" type="as">
+            <description>Top bar items to (forcefully) show.</description>
+            <default>[]</default>
+        </key>
+        <key name="family-order-appindicator" type="as">
+            <description>
+                Order of AppIndicator/KStatusNotifierItem (tray) items,
+                identified by derived application id, when
+                appindicator-order-mode is "full".
+            </description>
+            <default>[]</default>
+        </key>
+        <key name="appindicator-order-mode" type="s">
+            <choices>
+                <choice value='off'/>
+                <choice value='safe'/>
+                <choice value='full'/>
+            </choices>
+            <default>'safe'</default>
+            <description>
+                Whether and how to order AppIndicator/KStatusNotifierItem
+                (tray) items. "off" never touches them. "safe" places a newly
+                created tray icon adjacent to the last-known tray icon once,
+                without ever reparenting it again. "full" keeps a persisted
+                custom order for tray icons, same as other top bar items, at
+                the cost of the residual reparent-crash risk tray icons carry.
+            </description>
+        </key>
+        <key name="appindicator-order-exceptions" type="as">
+            <description>
+                Application ids (as derived by handleAppIndicatorItem, e.g.
+                "Nextcloud") excluded from reordering even when
+                appindicator-order-mode is "full". Their identity is still
+                tracked and they still appear in family-order-appindicator,
+                but no reparent is ever attempted for them; they stay wherever
+                they currently are.
+            </description>
+            <default>[]</default>
+        </key>
+    </schema>
+</schemalist>
