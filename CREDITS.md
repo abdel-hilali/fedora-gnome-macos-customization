@@ -59,9 +59,15 @@ From KDE Plasma (<https://invent.kde.org/plasma/plasma-workspace-wallpapers>), l
 
 The day and night pictures were scaled and cropped from 5120×2880 PNG to 3840×2160 JPEG. These changed pictures are shared under the same licence. Details: [wallpapers/CREDITS.txt](wallpapers/CREDITS.txt).
 
+## Terminal
+
+- **Powerlevel10k** by Roman Perepelitsa: <https://github.com/romkatv/powerlevel10k>, MIT. Not in this repository: the install downloads commit `d05a1b0`, unless your own zsh setup loads Powerlevel10k already, and runs its gitstatus installer, which fetches the `gitstatusd` program. [terminal/p10k-base.zsh](terminal/p10k-base.zsh) is a settings file made with Powerlevel10k's configuration wizard (rainbow style), used when you have no `~/.p10k.zsh`. [terminal/p10k-macstyle.zsh](terminal/p10k-macstyle.zsh) turns the segments into round pills.
+- **JetBrains Mono** by JetBrains, with icons added by **Nerd Fonts** (<https://github.com/ryanoasis/nerd-fonts>), SIL Open Font License 1.1. Not in this repository: the install downloads `JetBrainsMono.tar.xz` of Nerd Fonts v3.5.1, checks its SHA-256, and keeps four styles and `OFL.txt`.
+- From Fedora's own repositories, installed with dnf and not bundled: zsh-autosuggestions (MIT), zsh-syntax-highlighting (BSD-3-Clause), fastfetch (MIT), lsd (Apache-2.0), fzf (MIT) and zoxide (MIT). These are the projects' own licences; Fedora's packages also list those of the libraries built into them.
+
 ## macstyle's own code
 
-`install.sh`, `uninstall.sh`, [lib/](lib/), [bin/](bin/), [libexec/](libexec/), [systemd/](systemd/), [settings/](settings/) and the Downloads Fan extension, by Hilali Abdel, under the GNU General Public License 3.0 ([LICENSE](LICENSE)). The Downloads Fan files are marked GPL-2.0-or-later, which allows GPL-3.0.
+`install.sh`, `uninstall.sh`, [lib/](lib/), [bin/](bin/), [libexec/](libexec/), [systemd/](systemd/), [settings/](settings/), [terminal/](terminal/) (except `p10k-base.zsh`, see above) and the Downloads Fan extension, by Hilali Abdel, under the GNU General Public License 3.0 ([LICENSE](LICENSE)). The Downloads Fan files are marked GPL-2.0-or-later, which allows GPL-3.0.
 
 ## Not included
 

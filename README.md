@@ -19,7 +19,7 @@ cd fedora-gnome-macos-customization
 ```
 
 - Type it without `sudo`. It asks for your password itself, once, to install a few small Fedora packages and to set a Firefox default.
-- It takes about a minute. It downloads the MacTahoe icon theme (about 10 MB).
+- It takes about a minute. It downloads the MacTahoe icon theme (about 10 MB), a terminal font (about 7 MB) and Powerlevel10k, the prompt engine.
 - When it is done, **log out and log back in**. GNOME starts new extensions only at login.
 
 You need **Fedora 44 Workstation with GNOME 50**, the version macstyle is tested on. Run the script from a terminal inside your GNOME desktop. If `git` is missing: `sudo dnf install git`.
@@ -59,6 +59,16 @@ Downloads Fan is a GNOME extension made for macstyle.
 
 Turn on **Dark Style** in Quick Settings and everything follows at once: apps, top bar, dock, icons, window shadows and the wallpaper (each wallpaper has a day and a night picture). The light theme is a softer WhiteSur Light, gentler on the eyes than pure white.
 
+### A terminal that looks the part
+
+![The terminal in light and dark: the Fedora logo with system info, round pills in the prompt, ls with icons, an error pill and a grey suggestion](docs/screenshots/terminal.jpg)
+
+- Each new terminal window opens with the Fedora logo and a short system summary.
+- The prompt is a row of round pills: the folder, the git branch (green when clean, amber with changes), and on the right the time, an error pill when a command fails, and how long a slow command took.
+- As you type, a grey suggestion from your history appears (press → to take it), and commands turn green when they exist and red when they don't.
+- Ctrl+R searches your history as you type, `z name` jumps to a folder you used before, and `ls` shows icons with folders first.
+- The window is see-through, with the desktop blurred behind it, and it switches with Dark Style like everything else. VS Code's terminal gets the same prompt and font.
+
 ### And also
 
 - A blurred, translucent top bar and dock.
@@ -76,7 +86,8 @@ Everything goes into your home folder, except the packages and one Firefox setti
 - **Wallpapers:** in `~/.local/share/backgrounds/macstyle`.
 - **Two small background services** (systemd user units). `macstyle-darkswitch` follows Dark Style. `macstyle-appfollow` sets up Chromium and Electron apps when they are installed.
 - **Apps:** Chromium browsers and Electron apps run as X11 apps with GNOME's title bar, through launcher copies in `~/.local/share/applications`, so their menus can reach the top bar. VS Code gets the native title bar and colours that match it. Firefox also runs as an X11 app, with its global menu switched on. That is a default in `/etc/firefox/policies/policies.json`, which you can still change in `about:config`.
-- **Packages** (dnf): `libdbusmenu`, `libdbusmenu-gtk3`, `gnome-shell-extension-apps-menu`, `gnome-shell-extension-background-logo`.
+- **Terminal:** the terminal app (Ptyxis) runs zsh with a macstyle colour palette, the JetBrainsMono Nerd Font and a see-through background. Your login shell stays as it is. `~/.zshrc` gets two marked blocks, and if you have no `~/.zshrc` a new one is made. The prompt files go in `~/.config/macstyle/zsh`, and Powerlevel10k goes in `~/.local/share/macstyle` (unless you use your own). The font goes in `~/.local/share/fonts`. The configs of fastfetch and lsd go in `~/.config`.
+- **Packages** (dnf): `libdbusmenu`, `libdbusmenu-gtk3`, `gnome-shell-extension-apps-menu`, `gnome-shell-extension-background-logo`, and for the terminal `zsh`, `zsh-autosuggestions`, `zsh-syntax-highlighting`, `fastfetch`, `lsd`, `fzf`, `zoxide`.
 - **Settings:** window buttons on the left; themes, icons, cursor and wallpaper; workspaces on all monitors; the Downloads icon in the dock.
 
 Before changing anything, the first run saves your settings and every file it replaces in `~/.local/state/macstyle/original/`. Running `./install.sh` again is safe: it keeps that first copy.
@@ -88,6 +99,7 @@ Before changing anything, the first run saves your settings and every file it re
 | `-y`, `--yes` | Answer every question with its default (no prompts). |
 | `--no-packages` | Skip everything that needs `sudo`: the packages and the Firefox setting. |
 | `--no-apps` | Leave VS Code, Chrome and Firefox alone. |
+| `--no-terminal` | Leave the terminal and zsh alone. |
 | `--force` | Run on a Fedora or GNOME version macstyle is not tested on. |
 | `-h`, `--help` | Show the help. |
 
@@ -107,6 +119,7 @@ It brings back the settings and files saved by the first install, removes what t
 - Some apps run in X11 mode (through XWayland) so that their menus can reach the top bar. With X11 apps open, logging out takes about 5 seconds longer. This is a GNOME bug.
 - AppMenu, Multi Monitors Bar, Rounded Window Corners Reborn and Dash2Dock Motion are copies with our own fixes. extensions.gnome.org does not update them. To get our updates, run `git pull` and then `./install.sh` again.
 - Top-bar menus for Flatpak apps and Qt apps are not tested yet.
+- The terminal opens zsh, but your login shell does not change; type `bash` for bash. If you already use zsh, your `~/.zshrc` keeps all its lines and an existing Powerlevel10k setup is used, with macstyle's pills on top. `./uninstall.sh` takes the macstyle lines out again.
 - The SF Pro font is not included because of Apple's licence. If you have it installed already, macstyle uses it.
 
 ## Credits and licence

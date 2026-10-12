@@ -21,6 +21,8 @@ FIREFOX_POLICIES="${MACSTYLE_FIREFOX_POLICIES:-/etc/firefox/policies/policies.js
 # Extensions that come from Fedora packages instead of this repository.
 RPM_EXTENSIONS=(apps-menu@gnome-shell-extensions.gcampax.github.com background-logo@fedorahosted.org)
 PACKAGES=(libdbusmenu libdbusmenu-gtk3 gnome-shell-extension-apps-menu gnome-shell-extension-background-logo)
+# For the terminal (skipped with --no-terminal).
+TERMINAL_PACKAGES=(zsh zsh-autosuggestions zsh-syntax-highlighting fastfetch lsd fzf zoxide)
 # Docks that would fight with Dash2Dock Motion.
 CONFLICTING_EXTENSIONS=(dash-to-dock@micxgx.gmail.com ubuntu-dock@ubuntu.com dash2dock-lite@icedman.github.com)
 
@@ -39,7 +41,14 @@ DCONF_KEYS=(
     /org/gnome/desktop/background/picture-uri-dark
     /org/gnome/desktop/background/picture-options
     /org/gnome/mutter/workspaces-only-on-primary
+    /org/gnome/Ptyxis/use-system-font
+    /org/gnome/Ptyxis/font-name
+    /org/gnome/Ptyxis/interface-style
+    /org/gnome/Ptyxis/default-profile-uuid
+    /org/gnome/Ptyxis/profile-uuids
 )
+# Keys of the Ptyxis profile the install changes (under /org/gnome/Ptyxis/Profiles/UUID/).
+PTYXIS_PROFILE_KEYS=(palette opacity use-custom-command custom-command)
 
 if [[ -t 1 ]]; then
     B=$'\e[1m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' N=$'\e[0m'

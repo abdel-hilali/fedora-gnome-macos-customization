@@ -54,6 +54,16 @@ if [[ -e "$STATE/firefox-policies-new" || -e "$STATE/firefox-policies-existed" ]
 fi
 rm -rf -- "$STATE_HOME/macstyle-appfollow"
 
+step "Terminal"
+if [[ -f "$HOME/.zshrc" ]] && grep -q '# >>> macstyle terminal' "$HOME/.zshrc"; then
+    zshrc_args=(remove "$HOME/.zshrc")
+    [[ -e "$STATE/zshrc-created" ]] && zshrc_args+=(--created)
+    python3 -I "$REPO/lib/zshrc-blocks.py" "${zshrc_args[@]}"
+    ok "~/.zshrc: the macstyle lines are out (your own lines stay)"
+else
+    ok "nothing to undo in ~/.zshrc"
+fi
+
 step "Files"
 removed=0 restored=0
 if [[ -f "$INSTALLED" ]]; then
@@ -70,14 +80,20 @@ if [[ -f "$INSTALLED" ]]; then
         fi
     done < <(tac "$INSTALLED")
 fi
+rmdir "$CONFIG_HOME/$NAME/zsh" "$CONFIG_HOME/$NAME" "$DATA_HOME/$NAME" 2>/dev/null || true
 systemctl --user daemon-reload || true
 update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
 ok "$removed paths removed, $restored of them brought back as they were"
 
 step "Settings"
 if [[ -f "$ORIGINAL/dconf.ini" ]]; then
+    keys=("${DCONF_KEYS[@]}")
+    if [[ -f "$STATE/ptyxis-profile" ]]; then
+        uuid="$(cat "$STATE/ptyxis-profile")"
+        for k in "${PTYXIS_PROFILE_KEYS[@]}"; do keys+=("/org/gnome/Ptyxis/Profiles/$uuid/$k"); done
+    fi
     python3 -I "$REPO/lib/dconf-tool.py" restore "$ORIGINAL/dconf.ini" "$REPO/settings/extensions.dconf" \
-        "${DCONF_KEYS[@]}"
+        "${keys[@]}"
     ok "extension settings, themes, wallpaper and dock favourites as before"
 fi
 
@@ -89,8 +105,9 @@ cat <<EOF
     Log out and log back in to finish.
     The saved copy of your old desktop stays in $STATE_HOME/$NAME-uninstalled-*
     (delete it when you are happy). The Fedora packages from the install stay installed
-    (libdbusmenu, libdbusmenu-gtk3, the Apps Menu and Background Logo extensions); they
-    are harmless.
+    (libdbusmenu, libdbusmenu-gtk3, the Apps Menu and Background Logo extensions, and for
+    the terminal zsh, zsh-autosuggestions, zsh-syntax-highlighting, fastfetch, lsd, fzf and
+    zoxide); they are harmless.
 EOF
 if ask "Log out now? [y/N]" n; then
     gnome-session-quit --logout || true

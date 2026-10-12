@@ -6,6 +6,8 @@
         disabled-extensions); move the --disable ones the other way, if they are enabled
   dconf-tool.py add-favorite APP_ID
         add a launcher to the end of the dock's favourites, once
+  dconf-tool.py add-to-list KEY ITEM
+        add ITEM to the string list at the dconf KEY, once
   dconf-tool.py restore ORIGINAL.ini SETTINGS.dconf KEY...
         put back the extension folders named in SETTINGS.dconf and the KEYs as they were
         in ORIGINAL.ini (a `dconf dump /` taken before the first install); a key or folder
@@ -61,6 +63,16 @@ def cmd_add_favorite(args):
         write_list('/org/gnome/shell/favorite-apps', fav + [app])
 
 
+def cmd_add_to_list(args):
+    key, item = args
+    text = dconf('read', key).strip()
+    if text.startswith('@as '):
+        text = text[4:]
+    items = list(ast.literal_eval(text)) if text else []
+    if item not in items:
+        write_list(key, items + [item])
+
+
 def load_ini(path):
     cp = configparser.ConfigParser(interpolation=None, strict=False, delimiters=('=',))
     cp.optionxform = str
@@ -108,4 +120,5 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     cmd, rest = sys.argv[1], sys.argv[2:]
-    {'enable': cmd_enable, 'add-favorite': cmd_add_favorite, 'restore': cmd_restore}[cmd](rest)
+    {'enable': cmd_enable, 'add-favorite': cmd_add_favorite, 'add-to-list': cmd_add_to_list,
+     'restore': cmd_restore}[cmd](rest)

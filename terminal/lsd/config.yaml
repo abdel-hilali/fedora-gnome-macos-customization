@@ -1,0 +1,12 @@
+# macstyle: ls (lsd) with icons, folders first, colours from the terminal palette.
+color:
+  when: auto
+  theme: custom
+date: relative
+icons:
+  when: auto
+  theme: fancy
+  separator: "  "
+sorting:
+  dir-grouping: first
+size: short

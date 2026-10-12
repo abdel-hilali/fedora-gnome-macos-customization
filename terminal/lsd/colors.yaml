@@ -1,0 +1,39 @@
+# macstyle: only the 16 palette colours, so lsd turns light or dark with the terminal.
+user: dark_blue
+group: dark_grey
+permission:
+  read: dark_green
+  write: dark_yellow
+  exec: dark_red
+  exec-sticky: dark_magenta
+  no-access: dark_grey
+  octal: dark_cyan
+  acl: dark_cyan
+  context: dark_cyan
+date:
+  hour-old: dark_green
+  day-old: dark_cyan
+  older: dark_grey
+size:
+  none: dark_grey
+  small: dark_green
+  medium: dark_yellow
+  large: dark_red
+inode:
+  valid: dark_magenta
+  invalid: dark_grey
+links:
+  valid: dark_magenta
+  invalid: dark_grey
+tree-edge: dark_grey
+git-status:
+  default: dark_grey
+  unmodified: dark_grey
+  ignored: dark_grey
+  new-in-index: dark_green
+  new-in-workdir: dark_green
+  typechange: dark_yellow
+  deleted: dark_red
+  renamed: dark_green
+  modified: dark_yellow
+  conflicted: dark_red

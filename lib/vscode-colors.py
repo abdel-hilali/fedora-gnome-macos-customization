@@ -9,11 +9,13 @@ colour blocks make VS Code's own top area match it, so there is no seam:
                       the theme's own editor colour
 
 It also sets window.autoDetectColorScheme, so VS Code follows GNOME's Dark Style. A block or
-key that is already there is left alone. Every change is recorded, so --remove takes out
-exactly what was added (if it is still unchanged).
+key that is already there is left alone. With --terminal, VS Code's terminal runs zsh in the
+macstyle terminal font (these two keys replace other values; the old ones are recorded). Every
+change is recorded, so --remove takes out exactly what was added and puts back what was
+replaced (if it is still unchanged).
 
-  vscode-colors.py STATE_DIR            apply
-  vscode-colors.py --remove STATE_DIR   undo
+  vscode-colors.py STATE_DIR [--terminal]   apply
+  vscode-colors.py --remove STATE_DIR       undo
 """
 import glob
 import json
@@ -36,6 +38,8 @@ LIGHT = {
     'editor.background': '#f7f7f8', 'tab.activeBackground': '#f7f7f8',
     'tab.unfocusedActiveBackground': '#f7f7f8',
 }
+TERMINAL = {'terminal.integrated.defaultProfile.linux': 'zsh',
+            'terminal.integrated.fontFamily': "'JetBrainsMono Nerd Font', monospace"}
 DARK_SHELL = {'modernUI.shellBackground': '#373737', 'modernUI.inactiveShellBackground': '#373737',
               'surface.border': '#00000000'}
 DARK_PANELS = ['sideBar.background', 'sideBarSectionHeader.background',
@@ -226,7 +230,7 @@ def apps():
                 continue
 
 
-def apply(state_dir):
+def apply(state_dir, terminal=False):
     record_path = os.path.join(state_dir, 'vscode.json')
     try:
         records = json.load(open(record_path))
@@ -247,10 +251,21 @@ def apply(state_dir):
             continue
         dirs = theme_dirs(app_dir, product)
         rec = records.setdefault(path, {'keys': {}, 'blocks': {}})
+        replaced = rec.setdefault('replaced', {})
         new = text if text.strip() else '{\n}\n'
         if 'window.autoDetectColorScheme' not in settings:
             new = set_top_level(new, 'window.autoDetectColorScheme', True)
             rec['keys']['window.autoDetectColorScheme'] = True
+        term = []
+        for key, value in (TERMINAL.items() if terminal else ()):
+            if key not in settings:
+                rec['keys'][key] = value
+            elif settings[key] != value and key not in replaced:
+                replaced[key] = {'old': settings[key], 'new': value}
+            else:
+                continue
+            new = set_top_level(new, key, value)
+            term.append(key)
         colours = dict(settings.get('workbench.colorCustomizations') or {})
         light = pick_theme(settings, 'light', dirs)
         dark = pick_theme(settings, 'dark', dirs)
@@ -290,8 +305,9 @@ def apply(state_dir):
         else:
             mode = 0o644
         write(path, new, mode)
-        print('  %s: light "%s", dark "%s"%s' % (name, light, dark,
-              ' (colour blocks added)' if added else ''))
+        print('  %s: light "%s", dark "%s"%s%s' % (name, light, dark,
+              ' (colour blocks added)' if added else '',
+              '; terminal: zsh, JetBrainsMono Nerd Font' if term else ''))
     os.makedirs(state_dir, exist_ok=True)
     with open(record_path, 'w') as f:
         json.dump(records, f, indent=2)
@@ -316,6 +332,9 @@ def remove(state_dir):
         for key, value in rec.get('keys', {}).items():
             if settings.get(key) == value:
                 new = remove_top_level(new, key)
+        for key, change in rec.get('replaced', {}).items():
+            if settings.get(key) == change['new']:
+                new = set_top_level(new, key, change['old'])
         colours = dict(json.loads(strip_jsonc(new)).get('workbench.colorCustomizations') or {})
         changed = False
         for block, value in rec.get('blocks', {}).items():
@@ -336,7 +355,7 @@ def remove(state_dir):
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == '--remove':
         remove(sys.argv[2])
-    elif len(sys.argv) == 2:
-        apply(sys.argv[1])
+    elif len(sys.argv) in (2, 3) and not sys.argv[1].startswith('--'):
+        apply(sys.argv[1], terminal=sys.argv[2:] == ['--terminal'])
     else:
         sys.exit(__doc__)

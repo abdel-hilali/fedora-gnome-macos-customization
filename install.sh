@@ -14,6 +14,7 @@
 #   -y, --yes          answer every question with its default (no prompts)
 #   --no-packages      skip everything that needs sudo (packages, the Firefox setting)
 #   --no-apps          leave VS Code, Chrome and Firefox alone
+#   --no-terminal      leave the terminal and zsh alone
 #   --force            run on a Fedora or GNOME version this was not tested on
 #   -h, --help         show this help
 set -Eeuo pipefail
@@ -26,15 +27,21 @@ source "$REPO/lib/common.sh"
 TESTED_GNOME=50
 ICONS_COMMIT=839848b9a8a38a92a6936e30c4abe35cc6f2546d   # MacTahoe icon theme, 2026-09-10
 ICONS_URL="https://github.com/vinceliuice/MacTahoe-icon-theme/archive/$ICONS_COMMIT.tar.gz"
+# The terminal: JetBrains Mono with Nerd Font icons, and Powerlevel10k (the prompt engine).
+FONT_URL=https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz
+FONT_SHA256=04d5e8f903693f9dd13e16f867e994834e681eb3c72c0d337a770dcda09010cf
+P10K_COMMIT=d05a1b00f9a61f9578bf9dc19b8451942dde8734   # 2026-09-06
+P10K_URL="https://github.com/romkatv/powerlevel10k/archive/$P10K_COMMIT.tar.gz"
 WALLPAPERS=(mountain:Mountain sub-arctic:Sub-Arctic coast:Coast waterfall:Waterfall orionids:Orionids nuvole:Nuvole)
 DEFAULT_WALLPAPER=mountain
 
-ASSUME_YES=0 PACKAGES_ON=1 APPS_ON=1 FORCE=0
+ASSUME_YES=0 PACKAGES_ON=1 APPS_ON=1 TERMINAL_ON=1 FORCE=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes) ASSUME_YES=1 ;;
         --no-packages) PACKAGES_ON=0 ;;
         --no-apps) APPS_ON=0 ;;
+        --no-terminal) TERMINAL_ON=0 ;;
         --force) FORCE=1 ;;
         -h|--help) sed -n '2,/^set -E/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $arg (see ./install.sh --help)" ;;
@@ -136,8 +143,9 @@ packages() {
         warn "skipped (--no-packages): menus of Firefox, Chrome and VS Code may not reach the top bar"
         return
     fi
-    local missing=() p
-    for p in "${PACKAGES[@]}"; do rpm -q "$p" >/dev/null 2>&1 || missing+=("$p"); done
+    local missing=() p wanted=("${PACKAGES[@]}")
+    [[ $TERMINAL_ON = 1 ]] && wanted+=("${TERMINAL_PACKAGES[@]}")
+    for p in "${wanted[@]}"; do rpm -q "$p" >/dev/null 2>&1 || missing+=("$p"); done
     if ((${#missing[@]})) || { [[ $APPS_ON = 1 ]] && command -v firefox >/dev/null; }; then
         sudo -v || die "sudo did not work (wrong password, or this account is not an administrator)." \
             "Nothing on your desktop has changed yet. Run ./install.sh again, or ./install.sh --no-packages to skip this step."
@@ -146,7 +154,7 @@ packages() {
         info "installing: ${missing[*]}"
         sudo dnf install -y "${missing[@]}"
     fi
-    ok "packages: ${PACKAGES[*]}"
+    ok "packages: ${wanted[*]}"
     if [[ $APPS_ON = 1 ]] && command -v firefox >/dev/null; then
         # Firefox: its menu in the top bar, and GNOME's title bar instead of tabs in the title bar.
         # A default value for every profile, also ones made later; you can still change both
@@ -358,7 +366,9 @@ exec /usr/bin/code --ozone-platform=x11 "$@"
 EOF
         chmod 755 "$BIN_DIR/code"
     fi
-    python3 -I "$REPO/lib/vscode-colors.py" "$STATE"
+    local vscode_args=("$STATE")
+    [[ $TERMINAL_ON = 1 ]] && vscode_args+=(--terminal)
+    python3 -I "$REPO/lib/vscode-colors.py" "${vscode_args[@]}"
     if [[ -f /usr/share/applications/org.mozilla.firefox.desktop ]]; then
         { echo "# macstyle: copy of /usr/share/applications/org.mozilla.firefox.desktop with MOZ_ENABLE_WAYLAND=0,"
           echo "# so Firefox runs as an X11 client and its menu and window buttons go to the top bar."
@@ -370,6 +380,105 @@ EOF
     ok "apps done; an app that is open now changes the next time you start it"
 }
 
+terminal() {
+    step "Terminal: zsh with round pills, icons, the Fedora logo and a see-through window"
+    if [[ $TERMINAL_ON = 0 ]]; then
+        warn "skipped (--no-terminal)"
+        return
+    fi
+    if ! command -v zsh >/dev/null; then
+        warn "zsh is not installed (--no-packages?), so the terminal is left as it is"
+        return
+    fi
+    local tmp src fontdir="$DATA_HOME/fonts/JetBrainsMonoNerdFont" p10k="$DATA_HOME/$NAME/powerlevel10k"
+    if [[ -f "$fontdir/JetBrainsMonoNerdFont-Regular.ttf" ]]; then
+        ok "JetBrainsMono Nerd Font is already installed"
+    else
+        info "downloading the JetBrainsMono Nerd Font (about 7 MB)..."
+        tmp="$(mktemp -d)"
+        curl -fsSL --retry 3 "$FONT_URL" -o "$tmp/font.tar.xz" ||
+            die "could not download $FONT_URL. Check the internet connection and run ./install.sh again."
+        echo "$FONT_SHA256  $tmp/font.tar.xz" | sha256sum --check --quiet - ||
+            die "the font download does not match its checksum ($FONT_URL)."
+        mkdir -p "$tmp/font"
+        tar -xJf "$tmp/font.tar.xz" -C "$tmp/font" OFL.txt \
+            JetBrainsMonoNerdFont-{Regular,Bold,Italic,BoldItalic}.ttf
+        put "$tmp/font" "$fontdir"
+        rm -rf -- "$tmp"
+        fc-cache -f "$DATA_HOME/fonts" >/dev/null 2>&1 || true
+        ok "JetBrainsMono Nerd Font"
+    fi
+
+    # Powerlevel10k draws the prompt. A setup that loads it already keeps its own copy.
+    if [[ -f "$HOME/.zshrc" ]] && grep -q powerlevel10k "$HOME/.zshrc"; then
+        ok "Powerlevel10k: your own, loaded by ~/.zshrc"
+    elif [[ -f "$p10k/powerlevel10k.zsh-theme" ]]; then
+        ok "Powerlevel10k is already downloaded"
+    else
+        info "downloading Powerlevel10k..."
+        tmp="$(mktemp -d)"
+        curl -fsSL --retry 3 "$P10K_URL" -o "$tmp/p10k.tar.gz" ||
+            die "could not download $P10K_URL. Check the internet connection and run ./install.sh again."
+        tar -xzf "$tmp/p10k.tar.gz" -C "$tmp"
+        src="$(find "$tmp" -maxdepth 1 -type d -name 'powerlevel10k-*' -print -quit)"
+        [[ -n "$src" && -f "$src/powerlevel10k.zsh-theme" ]] || die "the Powerlevel10k download looks wrong ($P10K_URL)."
+        put "$src" "$p10k"
+        rm -rf -- "$tmp"
+        ok "Powerlevel10k (commit ${P10K_COMMIT:0:7})"
+    fi
+    # gitstatusd, Powerlevel10k's fast git helper: fetched now, so the first prompt needs no download.
+    if [[ -f "$p10k/gitstatus/install" ]]; then
+        sh "$p10k/gitstatus/install" >/dev/null 2>&1 ||
+            warn "gitstatusd was not downloaded now; Powerlevel10k fetches it when you first open a terminal"
+    fi
+
+    local f
+    for f in macstyle.zsh p10k-base.zsh p10k-macstyle.zsh; do
+        put "$REPO/terminal/$f" "$CONFIG_HOME/$NAME/zsh/$f"
+    done
+    put "$REPO/terminal/fastfetch.jsonc" "$CONFIG_HOME/fastfetch/config.jsonc"
+    put "$REPO/terminal/lsd/config.yaml" "$CONFIG_HOME/lsd/config.yaml"
+    put "$REPO/terminal/lsd/colors.yaml" "$CONFIG_HOME/lsd/colors.yaml"
+    keep_original "$HOME/.zshrc"
+    [[ -e "$HOME/.zshrc" || -e "$STATE/zshrc-created" ]] || touch "$STATE/zshrc-created"
+    python3 -I "$REPO/lib/zshrc-blocks.py" add "$HOME/.zshrc"
+    ok "zsh: round pills prompt, typing help, Ctrl+R search, z jumps, ls with icons"
+
+    # Ptyxis, Fedora's terminal: our colours (light and dark), the font, a see-through background.
+    if [[ -f /usr/share/glib-2.0/schemas/org.gnome.Ptyxis.gschema.xml ]]; then
+        put "$REPO/terminal/macstyle.palette" "$DATA_HOME/org.gnome.Ptyxis/palettes/macstyle.palette"
+        local uuid login profile
+        uuid="$(gsettings get org.gnome.Ptyxis default-profile-uuid | tr -d "'")"
+        [[ -n "$uuid" ]] || uuid="$(gsettings get org.gnome.Ptyxis profile-uuids | grep -oE '[0-9a-f]{32}' | head -n 1 || true)"
+        if [[ -z "$uuid" ]]; then   # Ptyxis has not been opened yet: make its first profile
+            uuid="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+            gsettings set org.gnome.Ptyxis profile-uuids "['$uuid']"
+        fi
+        gsettings set org.gnome.Ptyxis default-profile-uuid "$uuid"
+        echo "$uuid" > "$STATE/ptyxis-profile"
+        profile="org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/$uuid/"
+        gsettings set org.gnome.Ptyxis use-system-font false
+        gsettings set org.gnome.Ptyxis font-name 'JetBrainsMono Nerd Font 11'
+        gsettings set org.gnome.Ptyxis interface-style 'system'
+        gsettings set "$profile" palette 'macstyle'
+        gsettings set "$profile" opacity 0.88
+        login="${MACSTYLE_LOGIN_SHELL:-$(getent passwd "$USER" | cut -d: -f7)}"
+        if [[ "${login##*/}" != zsh ]]; then   # the login shell stays; the terminal app runs zsh
+            gsettings set "$profile" use-custom-command true
+            gsettings set "$profile" custom-command 'zsh'
+        fi
+        # Blur my Shell blurs the desktop behind Ptyxis; the window stays opaque, so text is sharp.
+        local blur=/org/gnome/shell/extensions/blur-my-shell/applications
+        python3 -I "$REPO/lib/dconf-tool.py" add-to-list "$blur/whitelist" org.gnome.Ptyxis
+        dconf write "$blur/blur" true
+        dconf write "$blur/opacity" 255
+        dconf write "$blur/dynamic-opacity" false
+        ok "Ptyxis: macstyle colours in light and dark, the font, see-through with blur"
+    else
+        warn "Ptyxis (Fedora's terminal) is not installed: its colours, font and blur are skipped"
+    fi
+}
+
 finish() {
     step "Done"
     cat <<EOF
@@ -379,6 +488,7 @@ finish() {
       - Dark Style (Quick Settings) switches everything, wallpaper included.
       - Maximize a window: its buttons and its menu move to the top bar.
       - Click Downloads in the dock to fan out your newest files.
+      - Open Terminal: zsh with the round pills prompt (open a new one to see it).
 
     Undo everything:  ./uninstall.sh
     Log of this run:  $LOG
@@ -402,6 +512,7 @@ main() {
     settings
     services
     apps
+    terminal
     finish
 }
 
