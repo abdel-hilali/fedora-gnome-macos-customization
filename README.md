@@ -18,11 +18,11 @@ cd fedora-gnome-macos-customization
 ./install.sh
 ```
 
-- It asks for your password once, to install a few small Fedora packages and to set a Firefox default.
+- Type it without `sudo`. It asks for your password itself, once, to install a few small Fedora packages and to set a Firefox default.
 - It takes about a minute. It downloads the MacTahoe icon theme (about 10 MB).
 - When it is done, **log out and log back in**. GNOME starts new extensions only at login.
 
-You need **Fedora 44 Workstation with GNOME 50**, the version macstyle is tested on. Run the script as your normal user (without `sudo`), from a terminal inside your GNOME desktop. If `git` is missing: `sudo dnf install git`.
+You need **Fedora 44 Workstation with GNOME 50**, the version macstyle is tested on. Run the script from a terminal inside your GNOME desktop. If `git` is missing: `sudo dnf install git`.
 
 To undo everything, run `./uninstall.sh` (see [Uninstall](#uninstall)).
 

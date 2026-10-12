@@ -5,9 +5,10 @@
 #   cd fedora-gnome-macos-customization
 #   ./install.sh
 #
-# Run it as your normal user from a terminal inside your GNOME session. It asks for your
-# password once (for a few small Fedora packages and a Firefox setting), installs everything,
-# then asks you to log out and back in. ./uninstall.sh puts your desktop back as it was.
+# Run it as your normal user (no sudo in front) from a terminal inside your GNOME session.
+# It asks for your password once (for a few small Fedora packages and a Firefox setting),
+# installs everything, then asks you to log out and back in. ./uninstall.sh puts your
+# desktop back as it was.
 #
 # Options:
 #   -y, --yes          answer every question with its default (no prompts)
@@ -42,11 +43,13 @@ done
 
 trap 'die "install.sh stopped at line $LINENO. Your desktop is half set up: run ./install.sh again, or ./uninstall.sh to go back."' ERR
 
+# Before anything is written: as root, every setting would go to root's account, not yours.
+[[ $EUID -ne 0 ]] || die "run ./install.sh as your normal user, without sudo. It asks for your password itself when it needs it."
+
 # --- checks --------------------------------------------------------------------------------------
 
 preflight() {
     step "Checking this computer"
-    [[ $EUID -ne 0 ]] || die "run ./install.sh as your normal user, without sudo."
     for d in extensions themes settings bin systemd lib wallpapers; do
         [[ -d "$REPO/$d" ]] || die "$REPO/$d is missing. Run install.sh inside the folder you cloned with git."
     done
@@ -135,6 +138,10 @@ packages() {
     fi
     local missing=() p
     for p in "${PACKAGES[@]}"; do rpm -q "$p" >/dev/null 2>&1 || missing+=("$p"); done
+    if ((${#missing[@]})) || { [[ $APPS_ON = 1 ]] && command -v firefox >/dev/null; }; then
+        sudo -v || die "sudo did not work (wrong password, or this account is not an administrator)." \
+            "Nothing on your desktop has changed yet. Run ./install.sh again, or ./install.sh --no-packages to skip this step."
+    fi
     if ((${#missing[@]})); then
         info "installing: ${missing[*]}"
         sudo dnf install -y "${missing[@]}"
