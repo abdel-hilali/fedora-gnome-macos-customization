@@ -1,3 +1,6 @@
 # Local research notes about one machine; not part of the published project
 research/
 __pycache__/
+
+# Promo video, thumbnail and upload texts; not part of the published project
+promo/
