@@ -29,7 +29,9 @@ apply() {
     dconf write $b/dash-to-dock/style-dash-to-dock 2
     corners 0.75 '9 20 -4 85' '6 16 -5 65'
   else
-    dconf reset $b/panel/style-panel
+    # 0 = transparent: the light WhiteSur bar shows through the blur. Not a reset: since Blur my
+    # Shell 78 the default is 4 (automatic), which follows GNOME's dark shell style.
+    dconf write $b/panel/style-panel 0
     dconf write $b/dash-to-dock/style-dash-to-dock 1
     corners 0.12 '8 18 -4 68' '6 16 -5 50'
   fi

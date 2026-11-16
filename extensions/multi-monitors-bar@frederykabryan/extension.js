@@ -508,11 +508,29 @@ export default class MultiMonitorsExtension extends Extension {
 		ScreenshotPatch.patchScreenshotUI(this._settings);
 		this._monitorIndicators = new MonitorIndicatorsController(this._settings, () => mmPanel);
 		// GNOME's own overview dash lives on the primary monitor.
-		this._overviewDashIsolation = new DashIsolation.DashMonitorIsolation(
-			Main.overview.dash, this._settings, () => Main.layoutManager.primaryIndex);
+		const isolateOverviewDash = () => {
+			this._overviewDashIsolation = new DashIsolation.DashMonitorIsolation(
+				Main.overview.dash, this._settings, () => Main.layoutManager.primaryIndex);
+		};
+		// macstyle: during the startup animation a dock (Dash to Dock, Dash2Dock Motion) puts a
+		// stand-in actor where the overview dash goes; at login on GNOME 51 this enable() ran
+		// then and failed (_queueRedisplay is not a function). Wait for the real dash.
+		if (Main.layoutManager._startingUp) {
+			this._startupCompleteId = Main.layoutManager.connect('startup-complete', () => {
+				Main.layoutManager.disconnect(this._startupCompleteId);
+				this._startupCompleteId = 0;
+				isolateOverviewDash();
+			});
+		} else {
+			isolateOverviewDash();
+		}
 	}
 
 	disable() {
+		if (this._startupCompleteId) {
+			Main.layoutManager.disconnect(this._startupCompleteId);
+			this._startupCompleteId = 0;
+		}
 		this._overviewDashIsolation?.destroy();
 		this._overviewDashIsolation = null;
 		this._monitorIndicators?.destroy();

@@ -105,7 +105,7 @@ export class DashMonitorIsolation {
         } else if (active) {
             this._refreshDots();
         }
-        this._dash._queueRedisplay();
+        this._dash._queueRedisplay?.(); // macstyle: a stand-in dash has none
     }
 
     _enable() {
@@ -563,7 +563,7 @@ export class DashMonitorIsolation {
         // idempotent (it also cancels pending work), so no timeout, later,
         // handler or patch outlives us.
         this._disable();
-        this._dash._queueRedisplay();
+        this._dash._queueRedisplay?.(); // macstyle: a stand-in dash has none
         this._active = false;
         this._dash = null;
     }

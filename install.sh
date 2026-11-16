@@ -288,6 +288,12 @@ wallpapers() {
 <wallpapers>
 $xml</wallpapers>
 EOF
+    # A run after an update keeps the pair you picked from ours; otherwise "Mountain".
+    local current; current="$(gsettings get org.gnome.desktop.background picture-uri)"
+    if [[ "$current" == "'file://$WALL_DIR/"*"-l.jpg'" && -f "$(sed "s|^'file://||; s|'$||" <<<"$current")" ]]; then
+        ok "six day-and-night pairs (Settings > Appearance), your choice kept"
+        return
+    fi
     gsettings set org.gnome.desktop.background picture-uri "file://$WALL_DIR/$DEFAULT_WALLPAPER-l.jpg"
     gsettings set org.gnome.desktop.background picture-uri-dark "file://$WALL_DIR/$DEFAULT_WALLPAPER-d.jpg"
     gsettings set org.gnome.desktop.background picture-options zoom

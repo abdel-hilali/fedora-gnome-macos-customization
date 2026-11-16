@@ -1688,3 +1688,12 @@
 #dashtodockContainer.dash2dock-motion-glass-outline #dash.light-dash .dash-background {
     border: 1px solid rgba(128, 128, 128, 0.15);
 }
+
+/* macstyle patch (2026-11-16): the Show Applications button shows the icon theme's full-colour
+   Launchpad icon (view-app-grid). On Fedora 45 (GNOME 51) WhiteSur's way, a hidden symbolic
+   glyph over a picture, showed both icons at once; set here because extension stylesheets
+   come after the shell theme. */
+.show-apps .show-apps-icon {
+    -st-icon-style: regular;
+    background-image: none;
+}
