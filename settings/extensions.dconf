@@ -42,6 +42,9 @@ corner-radius=0
 pipeline='pipeline_default'
 sigma=30
 
+[org/gnome/shell/extensions/blur-my-shell/popup]
+blur=false
+
 [org/gnome/shell/extensions/blur-my-shell/screenshot]
 pipeline='pipeline_default'
 
