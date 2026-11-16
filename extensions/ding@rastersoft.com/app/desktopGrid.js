@@ -255,6 +255,7 @@ export var DesktopGrid = class extends SignalManager.SignalManager {
         });
 
         dropDestination.add_controller(dropTarget);
+        dropDestination.add_css_class('nodropborder');
     }
 
     receiveLeave() {

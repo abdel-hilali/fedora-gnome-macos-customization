@@ -23,6 +23,7 @@ import Clutter from 'gi://Clutter';
 import Graphene from 'gi://Graphene';
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -37,8 +38,26 @@ import * as MMCalendar from './mmcalendar.js';
 import * as Constants from './mmPanelConstants.js';
 import { StatusIndicatorsController } from './statusIndicatorsController.js';
 import { MirroredIndicatorButton } from './mirroredIndicatorButton.js';
+import {
+    CONTROL_ROLE, EXCLUDED_MIRROR_ROLES, indicatorIsEnabled, sourceIsVisible,
+} from './monitorIndicatorPolicy.js';
+import { currentMonitorKey } from './monitorIdentity.js';
+import {
+    PANEL_LAYOUT_KEY, distributePanelSections, fitScale, isVerticalPosition, panelColor, panelPosition,
+    verticalClockText,
+} from './monitorPanelPolicy.js';
+import { remapClone } from './verticalRemap.js';
+import { setBoxVertical } from './common.js';
 
 MMCalendar.setMainRef(Main);
+
+// Line height of the stacked clock on side bars (1 = the font's own).
+const CLOCK_LINE_HEIGHT = 1.6;
+
+// St.BoxLayout replaced `vertical` with `orientation` in GNOME 48.
+function isBoxVertical(box) {
+    return 'orientation' in box ? box.orientation === Clutter.Orientation.VERTICAL : box.vertical;
+}
 
 // Re-export for backward compatibility
 export const setMMPanelArrayRef = Constants.setMMPanelArrayRef;
@@ -50,6 +69,79 @@ export const AVAILABLE_INDICATORS_ID = Constants.AVAILABLE_INDICATORS_ID;
 export const TRANSFER_INDICATORS_ID = Constants.TRANSFER_INDICATORS_ID;
 export const EXCLUDE_INDICATORS_ID = Constants.EXCLUDE_INDICATORS_ID;
 export const PANEL_COLOR_ID = 'panel-color';
+export const SHOW_APP_INDICATORS_ID = 'show-app-indicators';
+
+// Box layout for the panel sections. Horizontal bars behave like a plain
+// Clutter.BoxLayout; side bars stack items and shrink the ones wider than
+// the bar, since mirrored indicators keep their horizontal shape.
+const PanelSectionLayout = GObject.registerClass(
+    class PanelSectionLayout extends Clutter.BoxLayout {
+        _fittedHeight(child, forWidth) {
+            const [, natWidth] = child.get_preferred_width(-1);
+            const scale = fitScale(natWidth, forWidth);
+            if (scale === 1)
+                return [...child.get_preferred_height(forWidth), natWidth, scale];
+            const [minHeight, natHeight] = child.get_preferred_height(natWidth);
+            return [minHeight * scale, natHeight * scale, natWidth, scale];
+        }
+
+        _visibleChildren(container) {
+            return container.get_children().filter(child => child.visible);
+        }
+
+        vfunc_get_preferred_height(container, forWidth) {
+            if (this.orientation !== Clutter.Orientation.VERTICAL)
+                return super.vfunc_get_preferred_height(container, forWidth);
+
+            const children = this._visibleChildren(container);
+            let min = this.spacing * Math.max(0, children.length - 1);
+            let nat = min;
+            for (const child of children) {
+                const [childMin, childNat] = this._fittedHeight(child, forWidth);
+                min += childMin;
+                nat += childNat;
+            }
+            return [min, nat];
+        }
+
+        vfunc_allocate(container, box) {
+            if (this.orientation !== Clutter.Orientation.VERTICAL) {
+                for (const child of container.get_children()) {
+                    if (child._mmFitScaled) {
+                        child.set_scale(1, 1);
+                        child._mmFitScaled = false;
+                    }
+                }
+                super.vfunc_allocate(container, box);
+                return;
+            }
+
+            const width = box.get_width();
+            let y = box.y1;
+            for (const child of this._visibleChildren(container)) {
+                const [, natHeight, natWidth, scale] = this._fittedHeight(child, width);
+                const childBox = new Clutter.ActorBox();
+                if (scale === 1) {
+                    childBox.x1 = box.x1;
+                    childBox.x2 = box.x2;
+                    childBox.y1 = y;
+                    childBox.y2 = y + natHeight;
+                } else {
+                    // Lay out at full size, then shrink about the top center.
+                    childBox.x1 = box.x1 + (width - natWidth) / 2;
+                    childBox.x2 = childBox.x1 + natWidth;
+                    childBox.y1 = y;
+                    childBox.y2 = y + natHeight / scale;
+                    child.set_pivot_point(0.5, 0);
+                }
+                if (child.scale_x !== scale || child.scale_y !== scale)
+                    child.set_scale(scale, scale);
+                child._mmFitScaled = scale !== 1;
+                child.allocate(childBox);
+                y += natHeight + this.spacing;
+            }
+        }
+    });
 
 
 const MultiMonitorsAppMenuButton = GObject.registerClass(
@@ -351,6 +443,7 @@ const MultiMonitorsPanel = GObject.registerClass(
             // Left box should expand and fill available space
             this._leftBox = new St.BoxLayout({
                 name: 'panelLeft',
+                layout_manager: new PanelSectionLayout(),
                 x_expand: true,
                 y_expand: true,  // Allow full height for activities hover
                 x_align: Clutter.ActorAlign.START,
@@ -368,17 +461,21 @@ const MultiMonitorsPanel = GObject.registerClass(
             });
             this.add_child(this._centerBox);
 
-            // Wrapper inside center box to center its single child (dateMenu)
-            this._centerBin = new St.Widget({
-                layout_manager: new Clutter.BinLayout(),
+            // Horizontal row inside center box so multiple center items
+            // (e.g. dateMenu + weather) sit side by side instead of stacking
+            this._centerBin = new St.BoxLayout({
+                layout_manager: new PanelSectionLayout(),
                 x_expand: true,
                 y_expand: true,  // Allow full height for dateMenu hover
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.FILL,
             });
             this._centerBox.add_child(this._centerBin);
 
             // Right box should align to the end
             this._rightBox = new St.BoxLayout({
                 name: 'panelRight',
+                layout_manager: new PanelSectionLayout(),
                 x_expand: true,
                 y_expand: false,
                 x_align: Clutter.ActorAlign.END
@@ -429,13 +526,19 @@ const MultiMonitorsPanel = GObject.registerClass(
                 this._showDateTime.bind(this));
             this._showDateTime();
 
+            this._showAppIndicatorsId = this._settings.connect('changed::' + SHOW_APP_INDICATORS_ID,
+                () => this._updatePanel());
+
             // Watch for late-loading extensions (like Apps and Places)
             this._startExtensionWatcher();
 
-            // Apply custom panel color
-            this._panelColorId = this._settings.connect('changed::' + PANEL_COLOR_ID,
-                this._applyPanelColor.bind(this));
-            this._applyPanelColor();
+            // Apply this monitor's bar position and color
+            this._mmPanelBox = mmPanelBox;
+            this._settings.connectObject(
+                'changed::' + PANEL_COLOR_ID, this._applyPanelColor.bind(this),
+                'changed::' + PANEL_LAYOUT_KEY, this._applyPanelLayout.bind(this),
+                this);
+            this._applyPanelLayout();
 
         }
 
@@ -475,11 +578,51 @@ const MultiMonitorsPanel = GObject.registerClass(
                 this._schedulePanelRefresh([50, 250, 1000]);
             };
 
+            // Extensions may populate a wrapper or reveal an existing hidden
+            // indicator without adding a new child to a primary panel box.
+            const watched = new Set();
+            const unwatch = actor => {
+                if (!watched.delete(actor))
+                    return;
+                actor.disconnectObject(this);
+                for (const child of actor.get_children())
+                    unwatch(child);
+            };
+            const watch = actor => {
+                if (watched.has(actor))
+                    return;
+                watched.add(actor);
+                actor.connectObject(
+                    'notify::visible', scheduleUpdate,
+                    'destroy', () => watched.delete(actor),
+                    this);
+                // Mirrors of sources without an icon yet are dropped as empty;
+                // rebuild once the icon arrives (AppIndicator loads it late
+                // on a hidden panel, issue #63).
+                if (actor instanceof St.Icon)
+                    actor.connectObject('notify::gicon', scheduleUpdate, this);
+                for (const signal of ['child-added', 'actor-added']) {
+                    if (GObject.signal_lookup(signal, actor.constructor.$gtype))
+                        actor.connectObject(signal, (_actor, child) => {
+                            watch(child);
+                            scheduleUpdate();
+                        }, this);
+                }
+                for (const signal of ['child-removed', 'actor-removed']) {
+                    if (GObject.signal_lookup(signal, actor.constructor.$gtype))
+                        actor.connectObject(signal, (_actor, child) => {
+                            unwatch(child);
+                            scheduleUpdate();
+                        }, this);
+                }
+                for (const child of actor.get_children())
+                    watch(child);
+            };
+
             // connectObject ties these handlers on the surviving Main.panel
             // boxes to THIS panel's lifetime, so they auto-disconnect when the
             // panel is destroyed (even from C on a monitor change). Otherwise
             // they keep firing scheduleUpdate against a disposed panel.
-            const signals = ['child-added', 'child-removed', 'actor-added', 'actor-removed'];
             for (const boxName of ['_leftBox', '_centerBox', '_rightBox']) {
                 const box = mainPanel[boxName];
                 if (!box)
@@ -489,11 +632,7 @@ const MultiMonitorsPanel = GObject.registerClass(
                 box.connectObject('destroy', () => {
                     this._primaryPanelBoxes = this._primaryPanelBoxes.filter(actor => actor !== box);
                 }, this);
-                // Clutter renamed actor-added/removed to child-added/removed.
-                for (const signal of signals) {
-                    if (GObject.signal_lookup(signal, box.constructor.$gtype))
-                        box.connectObject(signal, scheduleUpdate, this);
-                }
+                watch(box);
             }
         }
 
@@ -520,6 +659,9 @@ const MultiMonitorsPanel = GObject.registerClass(
         }
 
         _cleanup() {
+            // Transferred indicators go back to the main panel horizontal.
+            if (this._vertical)
+                this._syncSectionItems(false);
 
             // Clean up extension watcher
             if (this._extensionStateChangedId) {
@@ -579,10 +721,12 @@ const MultiMonitorsPanel = GObject.registerClass(
                 this._settings.disconnect(this._dateTimePositionId);
                 this._dateTimePositionId = null;
             }
-            if (this._panelColorId) {
-                this._settings.disconnect(this._panelColorId);
-                this._panelColorId = null;
+            if (this._showAppIndicatorsId) {
+                this._settings.disconnect(this._showAppIndicatorsId);
+                this._showAppIndicatorsId = null;
             }
+            this._settings?.disconnectObject(this);
+            this._mmPanelBox = null;
 
             Main.ctrlAltTabManager.removeGroup(this);
 
@@ -618,7 +762,7 @@ const MultiMonitorsPanel = GObject.registerClass(
                 return;
             }
 
-            if (this._settings.get_boolean(SHOW_ACTIVITIES_ID)) {
+            if (this._roleIsEnabled(name, this._settings.get_boolean(SHOW_ACTIVITIES_ID))) {
                 if (!this.statusArea[name]) {
                     let indicator = this._ensureIndicator(name);
                     if (indicator) {
@@ -633,8 +777,165 @@ const MultiMonitorsPanel = GObject.registerClass(
             }
         }
 
+        _monitorKey() {
+            return currentMonitorKey(this.monitorIndex);
+        }
+
+        _applyPanelLayout() {
+            if (!this._settings)
+                return;
+
+            const position = panelPosition(this._settings, this._monitorKey());
+            const vertical = isVerticalPosition(position);
+            if (this._vertical !== vertical) {
+                this._vertical = vertical;
+                for (const box of [this._leftBox, this._centerBox, this._centerBin, this._rightBox])
+                    setBoxVertical(box, vertical);
+                this._leftBox.x_align = vertical ? Clutter.ActorAlign.FILL : Clutter.ActorAlign.START;
+                this._leftBox.y_align = vertical ? Clutter.ActorAlign.START : Clutter.ActorAlign.FILL;
+                this._centerBox.x_align = vertical ? Clutter.ActorAlign.FILL : Clutter.ActorAlign.CENTER;
+                this._centerBox.y_align = vertical ? Clutter.ActorAlign.CENTER : Clutter.ActorAlign.FILL;
+                this._centerBin.x_align = vertical ? Clutter.ActorAlign.FILL : Clutter.ActorAlign.CENTER;
+                this._centerBin.y_align = vertical ? Clutter.ActorAlign.CENTER : Clutter.ActorAlign.FILL;
+                this._rightBox.x_align = vertical ? Clutter.ActorAlign.FILL : Clutter.ActorAlign.END;
+                this._rightBox.y_align = vertical ? Clutter.ActorAlign.END : Clutter.ActorAlign.FILL;
+                if (vertical)
+                    this.add_style_class_name('multimonitor-panel-vertical');
+                else
+                    this.remove_style_class_name('multimonitor-panel-vertical');
+            }
+            this._syncSectionItems();
+            this._syncClockLayout();
+            this._mmPanelBox?.setPosition(position);
+            this._applyPanelColor();
+            this.queue_relayout();
+        }
+
+        // Panel items lay their icons out in rows, which a side bar could only
+        // shrink to fit. Stack those rows instead so icons keep their size,
+        // and restore them when the bar goes horizontal or an item leaves.
+        _syncSectionItems(vertical = !!this._vertical) {
+            for (const box of [this._leftBox, this._centerBin, this._rightBox]) {
+                if (!box)
+                    continue;
+                // A flag of its own: _mmStackWatched would make
+                // _syncItemOrientation skip the box's child-added hook.
+                if (!box._mmSectionWatched) {
+                    box._mmSectionWatched = true;
+                    box.connectObject('child-removed', (_box, child) => {
+                        this._syncItemOrientation(child, false);
+                    }, this);
+                }
+                this._syncItemOrientation(box, vertical);
+            }
+        }
+
+        _syncItemOrientation(actor, vertical) {
+            if (actor instanceof MirroredIndicatorButton)
+                actor._syncPanelOrientation(vertical);
+            if (actor instanceof St.BoxLayout) {
+                if (vertical && !isBoxVertical(actor)) {
+                    setBoxVertical(actor, true);
+                    actor._mmStacked = true;
+                } else if (!vertical && actor._mmStacked) {
+                    setBoxVertical(actor, false);
+                    actor._mmStacked = false;
+                }
+            }
+            if (actor instanceof Clutter.Clone)
+                remapClone(actor, vertical);
+            if (vertical && !actor._mmStackWatched) {
+                // Mirrors rebuild their icon rows at runtime.
+                actor._mmStackWatched = true;
+                actor.connectObject('child-added', (_actor, child) => {
+                    if (this._vertical && this.contains(child))
+                        this._syncItemOrientation(child, true);
+                }, this);
+            }
+            for (const child of actor.get_children())
+                this._syncItemOrientation(child, vertical);
+        }
+
+        // Side bars are too narrow for the clock on one line. Panel buttons
+        // measure their height for an unconstrained width, so wrapping
+        // would be clipped to one line; break the text explicitly instead.
+        _syncClockLayout() {
+            const clutterText = this.statusArea.dateMenu?._clockDisplay?.clutter_text ?? null;
+            if (this._clockText !== clutterText) {
+                this._clockText?.disconnectObject(this);
+                this._clockText = clutterText;
+                this._clockOriginalText = null;
+                this._clockVerticalText = null;
+                clutterText?.connectObject(
+                    'notify::text', () => this._formatClock(),
+                    // St swaps the attribute list whenever it restyles the
+                    // label (hover, theme, scale), dropping the line height.
+                    'notify::attributes', () => this._syncClockLineHeight(),
+                    'destroy', () => {
+                        this._clockText = null;
+                    },
+                    this);
+            }
+            if (!clutterText)
+                return;
+            // Restyling replaces the label's attributes, dropping the line height.
+            const label = this.statusArea.dateMenu._clockDisplay;
+            if (this._clockLabel !== label) {
+                this._clockLabel?.disconnectObject(this);
+                this._clockLabel = label;
+                label.connectObject(
+                    'style-changed', () => this._syncClockLineHeight(),
+                    'destroy', () => {
+                        this._clockLabel = null;
+                    },
+                    this);
+            }
+            clutterText.line_alignment = Pango.Alignment.CENTER;
+            // Unwrapped text sits at the left of a label wider than it is,
+            // so on a side bar shrink the label to its text and center that.
+            label.x_align = this._vertical ? Clutter.ActorAlign.CENTER : Clutter.ActorAlign.FILL;
+            this._formatClock();
+        }
+
+        // Open up the stacked lines; at the default height they run together.
+        // St puts the theme's text styling (color included) in the same
+        // attribute list, so only add or remove the line height, never
+        // replace the list: clearing it left the clock black on top bars.
+        _syncClockLineHeight() {
+            const clutterText = this._clockText;
+            if (!clutterText || !Pango.attr_line_height_new)
+                return;
+            // GJS can't read an attribute's type, so match ours by value.
+            const lineHeight = Pango.attr_line_height_new(CLOCK_LINE_HEIGHT);
+            const attrs = clutterText.attributes?.copy() ?? new Pango.AttrList();
+            const removed = attrs.filter(attr => attr.equal(lineHeight));
+            if (!!removed === !!this._vertical)
+                return;
+            if (this._vertical)
+                attrs.insert(lineHeight);
+            clutterText.attributes = attrs;
+        }
+
+        _formatClock() {
+            const clutterText = this._clockText;
+            const text = clutterText.text;
+            this._syncClockLineHeight();
+            if (this._vertical) {
+                if (text === this._clockVerticalText)
+                    return;
+                this._clockOriginalText = text;
+                this._clockVerticalText = verticalClockText(text);
+                clutterText.text = this._clockVerticalText;
+            } else if (this._clockVerticalText !== null && text === this._clockVerticalText) {
+                this._clockVerticalText = null;
+                clutterText.text = this._clockOriginalText;
+            }
+        }
+
         _applyPanelColor() {
-            let color = this._settings.get_string(PANEL_COLOR_ID);
+            if (!this._settings)
+                return;
+            const color = panelColor(this._settings, this._monitorKey());
             if (color && color !== '') {
                 this.set_style('background-color: ' + color + ' !important;');
             } else {
@@ -651,7 +952,7 @@ const MultiMonitorsPanel = GObject.registerClass(
 
         _placeDateTime() {
             const name = 'dateMenu';
-            if (this._settings.get_boolean(SHOW_DATE_TIME_ID)) {
+            if (this._roleIsEnabled(name, this._settings.get_boolean(SHOW_DATE_TIME_ID))) {
                 const indicator = this._ensureIndicator(name);
                 if (!indicator)
                     return;
@@ -697,7 +998,7 @@ const MultiMonitorsPanel = GObject.registerClass(
 
         _showAppMenu() {
             let name = 'appMenu';
-            if (this._settings.get_boolean(SHOW_APP_MENU_ID)) {
+            if (this._roleIsEnabled(name, this._settings.get_boolean(SHOW_APP_MENU_ID))) {
                 if (!this.statusArea[name]) {
                     let indicator = new MultiMonitorsAppMenuButton(this);
                     this.statusArea[name] = indicator;
@@ -711,6 +1012,8 @@ const MultiMonitorsPanel = GObject.registerClass(
         }
 
         vfunc_get_preferred_width(forHeight) {
+            if (this._vertical)
+                return super.vfunc_get_preferred_width(forHeight);
             if (Main.layoutManager.monitors.length > this.monitorIndex)
                 return [0, Main.layoutManager.monitors[this.monitorIndex].width];
 
@@ -725,67 +1028,52 @@ const MultiMonitorsPanel = GObject.registerClass(
             const themeNode = this.get_theme_node();
             const contentBox = themeNode.get_content_box(box);
 
-            const allocWidth = contentBox.get_width();
+            // Side bars stack the sections top to bottom instead of left to right.
+            const vertical = !!this._vertical;
+            const crossSize = vertical ? contentBox.get_width() : -1;
+            const measure = actor => vertical
+                ? actor.get_preferred_height(crossSize)
+                : actor.get_preferred_width(-1);
+            const [, leftNat] = measure(this._leftBox);
+            const [centerMin, centerNat] = measure(this._centerBox);
+            const [, rightNat] = measure(this._rightBox);
 
-            // Get natural widths of each box to prevent overflow
-            const [, leftNatWidth] = this._leftBox.get_preferred_width(-1);
-            const [centerMinWidth, centerNatWidth] = this._centerBox.get_preferred_width(-1);
-            const [, rightNatWidth] = this._rightBox.get_preferred_width(-1);
+            const start = vertical ? contentBox.y1 : contentBox.x1;
+            const end = vertical ? contentBox.y2 : contentBox.x2;
+            const [leftSize, , rightSize] = distributePanelSections(
+                end - start, leftNat, centerMin, centerNat, rightNat);
 
-            let leftWidth, centerWidth, rightWidth;
-
-            // Keep the normal GNOME-like balanced layout while there is room.
-            // On narrow/portrait monitors the status area can exceed one third
-            // of the panel width; reserve it first so Quick Settings stays
-            // anchored to the monitor edge instead of being clipped away.
-            const sideWidth = Math.max(leftNatWidth, rightNatWidth);
-            if (sideWidth * 2 + centerNatWidth <= allocWidth) {
-                leftWidth = sideWidth;
-                rightWidth = sideWidth;
-                centerWidth = allocWidth - leftWidth - rightWidth;
-            } else {
-                rightWidth = Math.min(rightNatWidth, allocWidth);
-                const remainingAfterRight = allocWidth - rightWidth;
-                const centerFloor = Math.min(centerMinWidth, remainingAfterRight);
-                leftWidth = Math.min(leftNatWidth, Math.max(0, remainingAfterRight - centerFloor));
-                centerWidth = Math.max(0, allocWidth - leftWidth - rightWidth);
-            }
+            const section = (from, to) => {
+                const childBox = new Clutter.ActorBox();
+                childBox.x1 = vertical ? contentBox.x1 : from;
+                childBox.x2 = vertical ? contentBox.x2 : to;
+                childBox.y1 = vertical ? from : contentBox.y1;
+                childBox.y2 = vertical ? to : contentBox.y2;
+                return childBox;
+            };
 
             // Left box - aligned to start
-            const leftChildBox = new Clutter.ActorBox();
-            leftChildBox.x1 = contentBox.x1;
-            leftChildBox.y1 = contentBox.y1;
-            leftChildBox.x2 = contentBox.x1 + leftWidth;
-            leftChildBox.y2 = contentBox.y2;
-            this._leftBox.allocate(leftChildBox);
+            this._leftBox.allocate(section(start, start + leftSize));
             this._leftBox.clip_to_allocation = true;
 
             // Right box - aligned to end
-            const rightChildBox = new Clutter.ActorBox();
-            rightChildBox.x1 = contentBox.x2 - rightWidth;
-            rightChildBox.y1 = contentBox.y1;
-            rightChildBox.x2 = contentBox.x2;
-            rightChildBox.y2 = contentBox.y2;
-            this._rightBox.allocate(rightChildBox);
+            this._rightBox.allocate(section(end - rightSize, end));
             this._rightBox.clip_to_allocation = true;
 
             // Center box - perfectly centered between left and right
-            const centerChildBox = new Clutter.ActorBox();
-            centerChildBox.x1 = leftChildBox.x2;
-            centerChildBox.y1 = contentBox.y1;
-            centerChildBox.x2 = rightChildBox.x1;
-            centerChildBox.y2 = contentBox.y2;
-            this._centerBox.allocate(centerChildBox);
+            this._centerBox.allocate(section(start + leftSize, end - rightSize));
             // Keep the center actor from painting outside monitor bounds.
             this._centerBox.clip_to_allocation = true;
         }
 
-        _hideIndicators() {
+        _hideIndicators(keep = null) {
             for (let role in this.statusArea) {
                 let indicator = this.statusArea[role];
                 if (!indicator)
                     continue;
                 const container = indicator.container || indicator;
+                if (keep?.has(container))
+                    continue;
                 if (container?.hide)
                     container.hide();
             }
@@ -818,6 +1106,11 @@ const MultiMonitorsPanel = GObject.registerClass(
             indicator.destroy();
         }
 
+        _roleIsEnabled(role, fallback = true) {
+            return indicatorIsEnabled(this._settings,
+                currentMonitorKey(this.monitorIndex), role, fallback);
+        }
+
         _ensureIndicator(role) {
 
             // CRITICAL FIX: Never create activities indicator on primary monitor
@@ -828,10 +1121,17 @@ const MultiMonitorsPanel = GObject.registerClass(
             let indicator = this.statusArea[role];
             if (indicator) {
                 indicator.container.show();
+                this._shownInRefresh?.add(indicator.container);
                 // CRITICAL FIX: Return the existing indicator instead of null!
                 return indicator;
             }
             else {
+                if (role === CONTROL_ROLE) {
+                    indicator = Main.panel.statusArea[role]?.createMirrorButton();
+                    if (indicator)
+                        this.statusArea[role] = indicator;
+                    return indicator;
+                }
                 let constructor = MULTI_MONITOR_PANEL_ITEM_IMPLEMENTATIONS[role];
                 if (!constructor) {
                     // For indicators not implemented here, mirror ANY indicator from main panel
@@ -905,11 +1205,10 @@ const MultiMonitorsPanel = GObject.registerClass(
         }
 
         _getGrabSprite(event) {
+            // Only reached on GNOME 50+, where Meta.Window.begin_grab_op()
+            // takes the Clutter.Sprite that Clutter.Backend hands out.
             const backend = global.stage.get_context().get_backend();
-            if (backend && typeof backend.get_sprite === 'function')
-                return backend.get_sprite(global.stage, event);
-
-            return null;
+            return backend.get_sprite(global.stage, event);
         }
 
         _beginWindowGrab(dragWindow, event, x, y, button = -1) {
@@ -1008,6 +1307,33 @@ const MultiMonitorsPanel = GObject.registerClass(
             return this._tryDragWindow(event);
         }
 
+        _getMainCenterRank(role) {
+            // Index of the role's actor in the main panel's center box, or -1
+            const mainBox = Main.panel?._centerBox;
+            const mainIndicator = Main.panel?.statusArea?.[role];
+            if (!mainBox || !mainIndicator)
+                return -1;
+            const mainContainer = mainIndicator.container || mainIndicator;
+            return mainBox.get_children().findIndex(child =>
+                child === mainContainer || child.contains(mainContainer));
+        }
+
+        _getCenterInsertIndex(role, position, exclude = null) {
+            // Keep center items in the main panel's center order. The dateMenu
+            // is placed separately, so list positions alone are not enough.
+            const children = this._centerBin.get_children().filter(child => child !== exclude);
+            const rank = this._getMainCenterRank(role);
+            if (rank < 0)
+                return Math.max(0, Math.min(position, children.length));
+            let index = 0;
+            for (const child of children) {
+                const childRank = child._mmRole ? this._getMainCenterRank(child._mmRole) : -1;
+                if (childRank >= 0 && childRank < rank)
+                    index++;
+            }
+            return index;
+        }
+
         _addToPanelBox(role, indicator, position, box) {
 
             // Exactly mimic the main Panel._addToPanelBox behavior
@@ -1037,18 +1363,36 @@ const MultiMonitorsPanel = GObject.registerClass(
                 });
             }
 
-            // Critical: Remove from existing parent BEFORE adding (like main Panel)
+            // Moving an item resets its hover state and closes its menu, so
+            // leave it alone when it is already where it belongs.
+            const centered = box === this._centerBox && !!this._centerBin;
+            const target = centered ? this._centerBin : box;
             const parent = container.get_parent();
+            if (parent === target) {
+                const index = centered
+                    ? this._getCenterInsertIndex(role, position, container)
+                    : Math.max(0, Math.min(position, target.get_n_children() - 1));
+                if (target.get_children().indexOf(container) === index) {
+                    container.show();
+                    this._shownInRefresh?.add(container);
+                    if (indicator.menu)
+                        this.menuManager.addMenu(indicator.menu);
+                    if (role === 'dateMenu')
+                        this._syncClockLayout();
+                    return;
+                }
+            }
+
+            // Critical: Remove from existing parent BEFORE adding (like main Panel)
             if (parent)
                 parent.remove_child(container);
 
             // Show container BEFORE adding (like main Panel)
             container.show();
+            this._shownInRefresh?.add(container);
 
             // If targeting center box, place the item in the center wrapper and center it
-            if (box === this._centerBox && this._centerBin) {
-                // Remove any existing children from centerBin first
-                this._centerBin.remove_all_children();
+            if (centered) {
                 container.x_align = Clutter.ActorAlign.CENTER;
                 // Use FILL for dateMenu so hover takes full panel height
                 if (role === 'dateMenu') {
@@ -1057,7 +1401,9 @@ const MultiMonitorsPanel = GObject.registerClass(
                 } else {
                     container.y_align = Clutter.ActorAlign.CENTER;
                 }
-                this._centerBin.add_child(container);
+                container._mmRole = role;
+                this._centerBin.insert_child_at_index(container,
+                    this._getCenterInsertIndex(role, position));
             } else {
                 // Add to box at position
                 box.insert_child_at_index(container, position);
@@ -1067,19 +1413,29 @@ const MultiMonitorsPanel = GObject.registerClass(
             // Add menu if it exists
             if (indicator.menu)
                 this.menuManager.addMenu(indicator.menu);
+
+            if (role === 'dateMenu')
+                this._syncClockLayout();
         }
 
         _updatePanel() {
             if (!this._settings)
                 return;
-            this._hideIndicators();
+            // Hide only what this refresh does not show again. Hiding everything
+            // first made every item flicker and closed its open menu.
+            const shown = new Set();
+            this._shownInRefresh = shown;
+            try {
+                // Clone ALL indicators from main panel instead of just the default ones
+                this._cloneAllMainPanelIndicators();
 
-            // Clone ALL indicators from main panel instead of just the default ones
-            this._cloneAllMainPanelIndicators();
 
-
-            // Ensure system tray is rightmost
-            this._ensureQuickSettingsRightmost();
+                // Ensure system tray is rightmost
+                this._ensureQuickSettingsRightmost();
+            } finally {
+                this._shownInRefresh = null;
+            }
+            this._hideIndicators(shown);
 
         }
 
@@ -1091,18 +1447,7 @@ const MultiMonitorsPanel = GObject.registerClass(
             }
 
             // Indicators that should NOT be mirrored (system/accessibility indicators and GNOME 46 phantom indicators)
-            const excludedIndicators = [
-                'a11y',              // Accessibility menu
-                'dwellClick',        // Dwell click accessibility
-                'screencast',        // Screen recording indicator
-                'screenRecording',   // Screen recording indicator (alternative name)
-                'remoteAccess',      // Remote desktop indicator
-                'screenSharing',     // Screen sharing indicator
-                'keyboard',          // Keyboard layout (only needed on primary)
-                'power',             // Power indicator (only needed on primary)
-                'unsafeModeIndicator', // GNOME 46 unsafe mode (often empty)
-                'backgroundApps',    // GNOME 46 background apps indicator (often empty)
-            ];
+            const excludedIndicators = EXCLUDED_MIRROR_ROLES;
 
             // Get all indicators from main panel's three boxes
             const leftIndicators = [];
@@ -1119,7 +1464,9 @@ const MultiMonitorsPanel = GObject.registerClass(
                     if (!indicator) continue;
 
                     // Skip excluded indicators
-                    if (excludedIndicators.includes(role)) {
+                    const fallback = role === 'activities' ? this._settings.get_boolean(SHOW_ACTIVITIES_ID)
+                        : role === 'appMenu' ? this._settings.get_boolean(SHOW_APP_MENU_ID) : true;
+                    if (excludedIndicators.includes(role) || !this._roleIsEnabled(role, fallback)) {
                         continue;
                     }
 
@@ -1130,8 +1477,8 @@ const MultiMonitorsPanel = GObject.registerClass(
                     // so strict equality misses them and causes skipped mirrors.
                     if (indicator === child ||
                         container === child ||
-                        (child.contains && child.contains(container)) ||
-                        (container.contains && container.contains(child))) {
+                        child.contains(container) ||
+                        container.contains(child)) {
                         return role;
                     }
                 }
@@ -1143,7 +1490,7 @@ const MultiMonitorsPanel = GObject.registerClass(
                 const children = mainPanel._leftBox.get_children();
                 for (let child of children) {
                     const role = findRoleForChild(child);
-                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                    if (role && (sourceIsVisible(child) || this._mirrorFollowsVisibility(role))) {
                         leftIndicators.push(role);
                     }
                 }
@@ -1153,7 +1500,7 @@ const MultiMonitorsPanel = GObject.registerClass(
                 const children = mainPanel._centerBox.get_children();
                 for (let child of children) {
                     const role = findRoleForChild(child);
-                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                    if (role && (sourceIsVisible(child) || this._mirrorFollowsVisibility(role))) {
                         centerIndicators.push(role);
                     }
                 }
@@ -1163,7 +1510,7 @@ const MultiMonitorsPanel = GObject.registerClass(
                 const children = mainPanel._rightBox.get_children();
                 for (let child of children) {
                     const role = findRoleForChild(child);
-                    if (role && (child.visible || this._mirrorFollowsVisibility(role))) {
+                    if (role && (sourceIsVisible(child) || this._mirrorFollowsVisibility(role))) {
                         rightIndicators.push(role);
                     }
                 }
@@ -1178,9 +1525,20 @@ const MultiMonitorsPanel = GObject.registerClass(
                 this._removeRole(rightIndicators, 'activities');
             }
 
+            // Hide AppIndicator/tray icons (AppIndicator extension roles) if disabled
+            if (!this._settings.get_boolean(SHOW_APP_INDICATORS_ID)) {
+                const isAppIndicator = role => role.startsWith('appindicator');
+                for (const list of [leftIndicators, centerIndicators, rightIndicators]) {
+                    for (let i = list.length - 1; i >= 0; i--) {
+                        if (isAppIndicator(list[i]))
+                            list.splice(i, 1);
+                    }
+                }
+            }
+
             // Now mirror them in order
             const desiredRoles = new Set([...leftIndicators, ...centerIndicators, ...rightIndicators]);
-            if (this._settings.get_boolean(SHOW_DATE_TIME_ID))
+            if (this._roleIsEnabled('dateMenu', this._settings.get_boolean(SHOW_DATE_TIME_ID)))
                 desiredRoles.add('dateMenu');
             this._removeStaleIndicators(desiredRoles);
 
@@ -1245,13 +1603,24 @@ const MultiMonitorsPanel = GObject.registerClass(
                 return;
             }
 
+            const isPrimary = this.monitorIndex === Main.layoutManager.primaryIndex;
+            const seen = new Set();
             let nChildren = box.get_n_children();
+            // Left/right boxes: keep each item after the previous one and only
+            // move items that are out of order. Moving an item resets its hover
+            // state (flicker) and closes its menu, and refreshes run often.
+            let previous = null;
 
             for (let i = 0; i < elements.length; i++) {
                 let role = elements[i];
 
+                // Two main panel children can resolve to the same role.
+                if (seen.has(role))
+                    continue;
+                seen.add(role);
+
                 // Skip activities button on primary monitor - it already has one
-                if (role === 'activities' && this.monitorIndex === Main.layoutManager.primaryIndex) {
+                if (role === 'activities' && isPrimary) {
                     continue;
                 }
 
@@ -1263,8 +1632,24 @@ const MultiMonitorsPanel = GObject.registerClass(
                         this._destroyIndicator(role);
                         continue;
                     }
-                    this._addToPanelBox(role, indicator, i + nChildren, box);
-                } else {
+                    if (box === this._centerBox) {
+                        this._addToPanelBox(role, indicator, i, box);
+                        continue;
+                    }
+
+                    const container = indicator.container || indicator;
+                    const children = box.get_children();
+                    const index = container.get_parent() === box ? children.indexOf(container) : -1;
+                    const previousIndex = previous ? children.indexOf(previous) : -1;
+                    let position;
+                    if (index >= 0 && index > previousIndex)
+                        position = index; // already in order: stays put
+                    else if (previous)
+                        position = index >= 0 ? previousIndex : previousIndex + 1; // right after previous
+                    else
+                        position = nChildren;
+                    this._addToPanelBox(role, indicator, position, box);
+                    previous = container;
                 }
             }
         }
@@ -1369,7 +1754,7 @@ MultiMonitorsPanel.prototype._findRoleByPattern = function (pattern) {
 MultiMonitorsPanel.prototype._ensureQuickSettingsRightmost = function () {
     const role = 'quickSettings';
     const mainQS = Main.panel.statusArea[role];
-    if (!mainQS) {
+    if (!mainQS || !this._roleIsEnabled(role)) {
         // No quick settings on main panel; remove mirror if any
         if (this.statusArea[role]) {
             const ind = this.statusArea[role];
@@ -1387,10 +1772,7 @@ MultiMonitorsPanel.prototype._ensureQuickSettingsRightmost = function () {
         this.statusArea[role] = indicator;
     }
 
-    // Move/add to be the last item in the right box
-    const container = indicator.container ? indicator.container : indicator;
-    const parent = container.get_parent();
-    if (parent) parent.remove_child(container);
+    // Move/add to be the last item in the right box (left alone if it already is)
     this._addToPanelBox(role, indicator, this._rightBox.get_n_children(), this._rightBox);
     this._showDateTime();
 };

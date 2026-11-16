@@ -1,15 +1,103 @@
 import Adw from 'gi://Adw';
-import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import { PrefsFields } from './constants.js';
+
+// Copied from https://gjs.guide/guides/gio/file-operations.html#recursively-operating-on-files
+Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
+Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async');
+
+/**
+ * Callback signature for recursiveFileOperation().
+ *
+ * The example callback `recursiveDeleteCallback()` demonstrates how to
+ * recursively delete a directory of files, while skipping unsupported file types.
+ *
+ * @param {Gio.File} file - the file to operate on
+ * @param {Gio.FileType} fileType - the file type
+ * @param {Gio.Cancellable} [cancellable] - optional cancellable
+ * @returns {Promise|null} a Promise for the operation, or %null to ignore
+ */
+function recursiveDeleteCallback(file, fileType, cancellable = null) {
+    switch (fileType) {
+    case Gio.FileType.REGULAR:
+    case Gio.FileType.SYMBOLIC_LINK:
+        return file.delete(cancellable);
+
+    // Deviates from the guide: delete the directory once it is empty. In the
+    // guide no directory is deleted, since recursiveFileOperation() ends with
+    // callback(file, cancellable), without fileType. Adding it recurses forever
+    case Gio.FileType.DIRECTORY:
+        return recursiveFileOperation(file, recursiveDeleteCallback,
+            cancellable).then(() => file.delete(cancellable));
+
+    default:
+        return null;
+    }
+}
+
+
+/**
+ * Recursively operate on @file and any children it may have.
+ *
+ * @param {Gio.File} file - the file or directory to delete
+ * @param {Function} callback - a function that will be passed the file,
+ *     file type (e.g. regular, directory), and @cancellable
+ * @param {Gio.Cancellable} [cancellable] - optional cancellable
+ * @returns {Promise} a Promise for the operation
+ */
+async function recursiveFileOperation(file, callback, cancellable = null) {
+    const fileInfo = await file.query_info_async('standard::type',
+        Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, GLib.PRIORITY_DEFAULT,
+        cancellable);
+    const fileType = fileInfo.get_file_type();
+
+    // If @file is a directory, collect all the operations as Promise branches
+    // and resolve them in parallel
+    if (fileType === Gio.FileType.DIRECTORY) {
+        const iter = await file.enumerate_children_async('standard::type',
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, GLib.PRIORITY_DEFAULT,
+            cancellable);
+
+        const branches = [];
+
+        while (true) {
+            // eslint-disable-next-line
+            const fileInfos = await iter.next_files_async(10, // max files
+                GLib.PRIORITY_DEFAULT, cancellable);
+
+            if (fileInfos.length === 0)
+                break;
+
+            for (const info of fileInfos) {
+                const child = iter.get_child(info);
+                const childType = info.get_file_type();
+
+                // The callback decides whether to process a file, including
+                // whether to recurse into a directory
+                const branch = callback(child, childType, cancellable);
+
+                if (branch)
+                    branches.push(branch);
+            }
+        }
+
+        await Promise.all(branches);
+    }
+
+    // Return the Promise for the top-level file
+    return callback(file, cancellable);
+}
 
 export default class ClipboardIndicatorPreferences extends ExtensionPreferences {
     fillPreferencesWindow (window) {
         window._settings = this.getSettings();
         const settingsUI = new Settings(window._settings);
+        settingsUI.window = window;
 
         const tabs = [
             { title: _('UI'),            iconName: 'view-grid-symbolic',               groups: [settingsUI.ui, settingsUI.item_actions] },
@@ -20,6 +108,7 @@ export default class ClipboardIndicatorPreferences extends ExtensionPreferences 
             { title: _('Topbar'),        iconName: 'edit-paste-symbolic',              groups: [settingsUI.topbar] },
             { title: _('Notifications'), iconName: 'emoji-objects-symbolic',           groups: [settingsUI.notifications] },
             { title: _('Shortcuts'),     iconName: 'input-keyboard-symbolic',          groups: [settingsUI.shortcuts] },
+            { title: _('Import / Export'), iconName: 'document-save-symbolic',         groups: [settingsUI.archive] },
         ];
 
         window.set_default_size(700, 650);
@@ -267,6 +356,33 @@ class Settings {
         this.shortcuts =  new Adw.PreferencesGroup({ title: _('Shortcuts') });
         this.search = new Adw.PreferencesGroup({title: _('Search')});
         this.item_actions = new Adw.PreferencesGroup({ title: _('Item Actions') });
+        this.archive = new Adw.PreferencesGroup({ title: _('Import / Export History') });
+
+        const exportButton = new Gtk.Button({
+            label: _('Export history'),
+            iconName: 'document-save-symbolic',
+            valign: Gtk.Align.CENTER,
+        });
+        exportButton.connect('clicked', () => this.#exportHistory());
+        const exportRow = new Adw.ActionRow({
+            title: _('Export clipboard history'),
+            subtitle: _('Save the registry and cached files as an archive'),
+        });
+        exportRow.add_suffix(exportButton);
+        this.archive.add(exportRow);
+
+        const importButton = new Gtk.Button({
+            label: _('Import history'),
+            iconName: 'document-open-symbolic',
+            valign: Gtk.Align.CENTER,
+        });
+        importButton.connect('clicked', () => this.#importHistory());
+        const importRow = new Adw.ActionRow({
+            title: _('Import clipboard history'),
+            subtitle: _('Restore an archive created by this extension'),
+        });
+        importRow.add_suffix(importButton);
+        this.archive.add(importRow);
 
         this.ui.add(this.field_preview_size);
         this.ui.add(this.field_confirm_clear_toggle);
@@ -354,6 +470,126 @@ class Settings {
 
         this.field_clear_history_interval.set_sensitive(this.field_clear_history_on_interval.active);
         this.#fetchExludedAppsList();
+
+        this.schema.connect(`changed::${PrefsFields.IMPORT_HISTORY_FROM}`, () => this.#onImportDone());
+    }
+
+    #cacheDirectory = `${GLib.get_user_cache_dir()}/clipboard-indicator@tudmotu.com`;
+    #importDirectory = null;
+
+    #showError (message) {
+        const dialog = new Gtk.AlertDialog({
+            message: _('Clipboard history import/export failed'),
+            detail: message,
+            buttons: [_('OK')],
+        });
+        dialog.choose(this.window, null, () => {});
+    }
+
+    // Resolves to the chosen path, or null when the dialog is dismissed
+    #chooseFile (save) {
+        const filter = new Gtk.FileFilter({ name: _('Clipboard history archives') });
+        filter.add_pattern('*.tar.gz');
+        const dialog = new Gtk.FileDialog({
+            title: save ? _('Export clipboard history') : _('Import clipboard history'),
+            accept_label: save ? _('Export') : _('Import'),
+            default_filter: filter,
+        });
+        if (save) dialog.initial_name = 'clipboard-history.tar.gz';
+
+        return new Promise((resolve, reject) => {
+            const done = (source, result) => {
+                try {
+                    resolve((save ? source.save_finish(result) : source.open_finish(result)).get_path());
+                }
+                catch (e) {
+                    if (e.matches(Gtk.DialogError, Gtk.DialogError.DISMISSED)) resolve(null);
+                    else reject(e);
+                }
+            };
+            if (save) dialog.save(this.window, null, done);
+            else dialog.open(this.window, null, done);
+        });
+    }
+
+    #runCommand (argv) {
+        const process = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDERR_PIPE);
+        return new Promise((resolve, reject) => {
+            process.communicate_utf8_async(null, null, (source, result) => {
+                try {
+                    const [, , stderr] = source.communicate_utf8_finish(result);
+                    if (source.get_successful()) resolve();
+                    else reject(new Error(stderr || argv[0]));
+                }
+                catch (e) {
+                    reject(e);
+                }
+            });
+        });
+    }
+
+    // The archive holds registry.txt and the image files it names,
+    // the same layout as the cache directory
+    async #exportHistory () {
+        try {
+            const archivePath = await this.#chooseFile(true);
+            if (!archivePath) return;
+
+            const registryPath = `${this.#cacheDirectory}/registry.txt`;
+            if (!GLib.file_test(registryPath, GLib.FileTest.EXISTS))
+                throw new Error(_('Clipboard history is empty'));
+            const [, contents] = GLib.file_get_contents(registryPath);
+            const images = JSON.parse(new TextDecoder().decode(contents))
+                .filter(entry => entry.mimetype?.startsWith('image/'))
+                .map(entry => GLib.path_get_basename(entry.contents))
+                .filter(name => GLib.file_test(`${this.#cacheDirectory}/${name}`, GLib.FileTest.EXISTS));
+
+            await this.#runCommand(['tar', '-czf', archivePath, '-C', this.#cacheDirectory,
+                'registry.txt', ...new Set(images)]);
+            this.window.add_toast(new Adw.Toast({ title: _('Clipboard history exported') }));
+        }
+        catch (e) {
+            this.#showError(e.message);
+        }
+    }
+
+    // Extract the archive and hand its directory to the extension, which
+    // merges it into the history. Remove the directory once it is done
+    async #importHistory () {
+        let directory = null;
+        try {
+            const archivePath = await this.#chooseFile(false);
+            if (!archivePath) return;
+
+            directory = GLib.dir_make_tmp('clipboard-indicator-import-XXXXXX');
+            await this.#runCommand(['tar', '-xzf', archivePath, '-C', directory])
+                .then(() => {
+                    const registry = Gio.file_new_for_path(`${directory}/registry.txt`);
+                    const type = registry.query_info('standard::type',
+                        Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null).get_file_type();
+                    if (type !== Gio.FileType.REGULAR) throw new Error();
+                    const [, contents] = registry.load_contents(null);
+                    if (!Array.isArray(JSON.parse(new TextDecoder().decode(contents))))
+                        throw new Error();
+                })
+                .catch(() => {
+                    throw new Error(_('The selected file is not a clipboard history archive'));
+                });
+
+            this.#importDirectory = directory;
+            this.schema.set_string(PrefsFields.IMPORT_HISTORY_FROM, directory);
+        }
+        catch (e) {
+            if (directory) recursiveDeleteCallback(Gio.File.new_for_path(directory), Gio.FileType.DIRECTORY).catch(() => {});
+            this.#showError(e.message);
+        }
+    }
+
+    #onImportDone () {
+        if (this.schema.get_string(PrefsFields.IMPORT_HISTORY_FROM) || !this.#importDirectory) return;
+        recursiveDeleteCallback(Gio.File.new_for_path(this.#importDirectory), Gio.FileType.DIRECTORY).catch(() => {});
+        this.#importDirectory = null;
+        this.window.add_toast(new Adw.Toast({ title: _('Clipboard history imported') }));
     }
 
     #createDisplayModeOptions () {

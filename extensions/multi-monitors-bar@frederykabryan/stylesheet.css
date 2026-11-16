@@ -5,6 +5,124 @@
     padding-bottom: 0px !important;
 }
 
+/* Left/right bars: tighter buttons so icons and the clock fit the column */
+.multimonitor-panel-vertical .panel-button {
+    -natural-hpadding: 4px;
+    -minimum-hpadding: 2px;
+    padding: 6px 4px;
+    min-height: 32px;
+}
+
+.multimonitor-panel-vertical .mm-vertical-remap {
+    padding: 0;
+}
+
+.multimonitor-panel-vertical .mm-vertical-remap-items {
+    spacing: 10px;
+}
+
+/* Breathing room between stacked indicators (extensions, tray, etc.) */
+.multimonitor-panel-vertical #panelLeft,
+.multimonitor-panel-vertical #panelCenter,
+.multimonitor-panel-vertical #panelRight {
+    spacing: 8px;
+}
+
+.multimonitor-panel-vertical .clock {
+    font-size: 12px;
+    font-weight: bold;
+    text-align: center;
+}
+
+/* The theme pads the clock pill by ~12px a side (under #panel, so it needs
+   an id to be overridden). On a side bar that padding made the clock wider
+   than the column, and the whole thing was shrunk to fit. */
+#panel.multimonitor-panel-vertical .panel-button.clock-display,
+#panel.multimonitor-panel-vertical .panel-button.clock-display .clock,
+#panel.multimonitor-panel-vertical .panel-button .clock {
+    -natural-hpadding: 0;
+    -minimum-hpadding: 0;
+    padding-left: 0;
+    padding-right: 0;
+    margin-left: 0;
+    margin-right: 0;
+}
+
+/* Keep workspace names and previews legible in the narrow side column.
+   No side padding: anything wider than the bar gets scaled down. */
+.multimonitor-panel-vertical .mm-workspace-indicator {
+    -natural-hpadding: 0;
+    -minimum-hpadding: 0;
+    padding: 8px 0;
+    min-width: 0;
+    min-height: 0;
+    color: #ffffff;
+}
+
+/* Swapped in for .status-label on side bars, whose fixed 8em width from
+   the Workspace Indicator stylesheet would force the name to be shrunk. */
+.multimonitor-panel-vertical .mm-workspace-indicator .mm-workspace-name {
+    font-size: 14px;
+    font-weight: bold;
+    text-align: center;
+    padding: 0;
+}
+
+.multimonitor-panel-vertical .mm-workspace-indicator .panel-status-menu-box {
+    spacing: 6px;
+    padding: 0;
+}
+
+.multimonitor-panel-vertical .mm-workspace-indicator .workspaces-box {
+    spacing: 6px;
+}
+
+.multimonitor-panel-vertical .mm-workspace-indicator .workspace {
+    width: 44px;
+    height: 28px;
+    min-height: 28px;
+    border-color: rgba(255, 255, 255, 0.5);
+    background-color: #505050;
+}
+
+.multimonitor-panel-vertical .mm-workspace-indicator .workspace.active {
+    border: 2px solid #ffffff;
+    background-color: #707070;
+}
+
+.multimonitor-panel-vertical .workspace-dots {
+    spacing: 3px;
+    padding: 8px 0;
+}
+
+.multimonitor-panel-vertical #mmPanelActivities,
+.multimonitor-panel-vertical .mm-activities {
+    -natural-hpadding: 4px;
+    -minimum-hpadding: 2px;
+    padding: 6px 4px;
+}
+
+.multimonitor-panel-vertical .workspace-dot {
+    background-color: rgba(255, 255, 255, 0.4);
+    border-radius: 6px;
+}
+
+.multimonitor-panel-vertical .workspace-dot.active {
+    background-color: #ffffff;
+}
+
+.multimonitor-panel-vertical .mm-quick-settings-box,
+.multimonitor-panel-vertical .mm-quick-settings-clip,
+.multimonitor-panel-vertical .mm-quick-settings-normal,
+.multimonitor-panel-vertical .mm-quick-settings-overview {
+    padding: 0;
+}
+
+.multimonitor-panel-vertical .mm-quick-settings-stack {
+    spacing: 12px;
+    padding: 6px 0;
+}
+
 .helloworld-label {
     font-size: 72px;
     font-weight: bold;
@@ -32,6 +150,61 @@
 
 .workspace-thumbnails-left:rtl {
     border-radius: 9px 0 0 9px;
+}
+
+/* Keep dock feedback on the rounded icon container. GNOME 50 uses
+   overview-tile in place of app-well-app; theme focus shadows may be important.
+   Rules are scoped under the dock bin ID: in overview the dock is reparented
+   into #overviewGroup, where extension rules such as Blur my Shell's
+   `.overview-components-transparent #overviewGroup .overview-tile:hover`
+   (1 id + 3 classes, !important) would otherwise outrank a single-id selector
+   and paint the full-height tile. Two ids win regardless of class count. */
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps,
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:hover,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:hover,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:hover,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:hover,
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:focus,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:focus,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:focus,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:focus,
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:active,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:active,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:active,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:active,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:selected,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:highlighted,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:checked,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:drop {
+    background-color: transparent !important;
+    background-image: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+}
+
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-icon {
+    border-radius: 1.5em;
+}
+
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:hover .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:focus .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:hover .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:focus .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:hover .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:focus .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:hover .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:focus .overview-icon {
+    background-color: rgba(255, 255, 255, 0.2) !important;
+}
+
+#multiMonitorsDockBin #dash.multimonitor-dock .app-well-app:active .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .overview-tile:active .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .grid-search-result:active .overview-icon,
+#multiMonitorsDockBin #dash.multimonitor-dock .show-apps:active .overview-icon {
+    background-color: rgba(255, 255, 255, 0.28) !important;
 }
 
 /* Mirrored indicators should inherit styling from their cloned source.

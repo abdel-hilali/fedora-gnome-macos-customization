@@ -19,6 +19,7 @@
 'use strict';
 import * as Enums from './enums.js';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 import Gdk from 'gi://Gdk?version=4.0';
 import * as FileUtils from './fileUtils.js';
 
@@ -190,10 +191,18 @@ export function loadDragData({fileList, specialFilesSelected}) {
     const textUriListContentProvider = Gdk.ContentProvider.new_for_bytes(Enums.DndTargetInfo.URI_LIST,
         encodedUriList);
 
+    const gfiles = [];
+    for (const file of fileList)
+        gfiles.push(Gio.File.new_for_uri(file.uri));
+
+    const gdkFileList = Gdk.FileList.new_from_list(gfiles);
+    const fileListContentProvider = Gdk.ContentProvider.new_for_value(gdkFileList);
+
     return Gdk.ContentProvider.new_union([
         dingContentProvider,
         gnomeContentProvider,
         textUriListContentProvider,
+        fileListContentProvider,
     ]);
 }
 

@@ -24,7 +24,6 @@ import Pango from 'gi://Pango';
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
 
-import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as MessageList from 'resource:///org/gnome/shell/ui/messageList.js';
 import * as DateMenu from 'resource:///org/gnome/shell/ui/dateMenu.js';
 import * as Calendar from 'resource:///org/gnome/shell/ui/calendar.js';
@@ -51,7 +50,7 @@ const MultiMonitorsTodayButton = GObject.registerClass(
                 can_focus: true,
             });
 
-            let hbox = new St.BoxLayout({ vertical: true });
+            let hbox = new St.BoxLayout({ ...Common.verticalBoxProps() });
             this.add_child(hbox);
 
             this._dayLabel = new St.Label({
@@ -128,7 +127,7 @@ const MultiMonitorsPlaceholder = GObject.registerClass(
         _init() {
             super._init({
                 style_class: 'message-list-placeholder',
-                vertical: true,
+                ...Common.verticalBoxProps(),
             });
             this._date = new Date();
 
@@ -142,7 +141,7 @@ const MultiMonitorsPlaceholder = GObject.registerClass(
 
 const MultiMonitorsCalendar = Calendar.Calendar;
 
-var MultiMonitorsEventsSection = (() => {
+const MultiMonitorsEventsSection = (() => {
     let MultiMonitorsEventsSection = class MultiMonitorsEventsSection extends St.Button {
         _init() {
             super._init({
@@ -151,7 +150,7 @@ var MultiMonitorsEventsSection = (() => {
                 x_expand: true,
                 child: new St.BoxLayout({
                     style_class: 'events-box',
-                    vertical: true,
+                    ...Common.verticalBoxProps(),
                     x_expand: true,
                 }),
             });
@@ -169,7 +168,7 @@ var MultiMonitorsEventsSection = (() => {
 
             this._eventsList = new St.BoxLayout({
                 style_class: 'events-list',
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 x_expand: true,
             });
             this.child.add_child(this._eventsList);
@@ -224,7 +223,7 @@ var MultiMonitorsEventsSection = (() => {
     return GObject.registerClass(MultiMonitorsEventsSection);
 })();
 
-var MultiMonitorsNotificationSection = (() => {
+const MultiMonitorsNotificationSection = (() => {
     // Check if MessageListSection is available, otherwise use St.Widget as base
     // MessageListSection is available in GNOME 40+, use version check
     const BaseClass = (shellVersion >= 40 && MessageList.MessageListSection)
@@ -270,7 +269,7 @@ var MultiMonitorsNotificationSection = (() => {
     return GObject.registerClass(MultiMonitorsNotificationSection);
 })();
 
-var MultiMonitorsCalendarMessageList = (() => {
+const MultiMonitorsCalendarMessageList = (() => {
     let MultiMonitorsCalendarMessageList = class MultiMonitorsCalendarMessageList extends St.Widget {
         // _init will be defined after copyClass
         _initCustom() {
@@ -287,7 +286,7 @@ var MultiMonitorsCalendarMessageList = (() => {
             this.add_child(this._placeholder);
 
             let box = new St.BoxLayout({
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 x_expand: true, y_expand: true
             });
             this.add_child(box);
@@ -341,7 +340,7 @@ var MultiMonitorsCalendarMessageList = (() => {
 
             this._sectionList = new St.BoxLayout({
                 style_class: 'message-list-sections',
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 x_expand: true,
                 y_expand: true,
                 y_align: Clutter.ActorAlign.START
@@ -417,7 +416,7 @@ var MultiMonitorsCalendarMessageList = (() => {
     return RegisteredClass;
 })();
 
-var MultiMonitorsMessagesIndicator = (() => {
+const MultiMonitorsMessagesIndicator = (() => {
     let MultiMonitorsMessagesIndicator = class MultiMonitorsMessagesIndicator extends St.Icon {
         _init() {
             super._init({
@@ -553,8 +552,8 @@ var MultiMonitorsMessagesIndicator = (() => {
     return GObject.registerClass(MultiMonitorsMessagesIndicator);
 })();
 
-var MultiMonitorsDateMenuButton = (() => {
-    const BaseDateMenuButton = DateMenu.DateMenuButton ?? PanelMenu.Button;
+const MultiMonitorsDateMenuButton = (() => {
+    const BaseDateMenuButton = DateMenu.DateMenuButton;
 
     let MultiMonitorsDateMenuButton = class MultiMonitorsDateMenuButton extends BaseDateMenuButton {
         _init(panel = null) {
@@ -700,7 +699,7 @@ var MultiMonitorsDateMenuButton = (() => {
             vbox.add_child(this._displaysSection);
 
             let displaysBox = new St.BoxLayout({
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 x_expand: true,
                 style_class: 'datemenu-displays-box'
             });
@@ -823,15 +822,7 @@ var MultiMonitorsDateMenuButton = (() => {
             };
 
             try {
-                if (typeof super._setEventSource === 'function') {
-                    super._setEventSource(eventSource);
-                } else {
-                    // Fallback path (no upstream DateMenuButton to inherit from).
-                    this._eventSource?.destroy();
-                    this._calendar?.setEventSource(eventSource);
-                    this._eventsItem?.setEventSource(eventSource);
-                    this._eventSource = eventSource;
-                }
+                super._setEventSource(eventSource);
             } finally {
                 delete eventSource.connect;
             }

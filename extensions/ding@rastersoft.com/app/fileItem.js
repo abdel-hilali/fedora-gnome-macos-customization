@@ -348,7 +348,7 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
         this._unixmode = fileInfo.get_attribute_uint32('unix::mode');
         this._writableByOthers = (this._unixmode & Enums.S_IWOTH) !== 0;
         this._trusted = fileInfo.get_attribute_as_string('metadata::trusted') === 'true';
-        this._useSandboxing = fileInfo.get_attribute_as_string('metadata::nosandbox') === 'false';
+        this._useSandboxing = fileInfo.get_attribute_as_string('metadata::nosandbox') !== 'true';
         this._attributeContentType = fileInfo.get_content_type();
         this._isDesktopFile = this._attributeContentType === 'application/x-desktop';
         this._isAppImageFile = this._attributeContentType === 'application/vnd.appimage';
@@ -419,7 +419,7 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
         return launchContext;
     }
 
-    _doOpenContext(context, fileList) {
+    _doOpenContext(context, fileList, timestamp) {
         if (!fileList)
             fileList = [];
 
@@ -440,12 +440,12 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
             this._launchAppImageFile(context, fileList);
 
 
-        if (this._isDirectory && this._desktopManager.useNemo) {
+        if (this._isDirectory) {
             try {
-                DesktopIconsUtil.trySpawn(GLib.get_home_dir(), ['nemo', this.file.get_uri()], DesktopIconsUtil.getFilteredEnviron());
+                DBusUtils.RemoteFileOperations.ShowFolderRemote(this.file.get_uri(), timestamp);
                 return;
             } catch (err) {
-                console.log(`Couldn't launch Nemo: ${err.message}\n${err}`);
+                console.log(`Couldn't launch default file manager to open a folder: ${err.message}\n${err}`);
             }
         }
 
@@ -706,7 +706,7 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
         if (!fileList)
             fileList = [];
 
-        this._doOpenContext(this._getDefaultLaunchContext(timestamp), fileList);
+        this._doOpenContext(this._getDefaultLaunchContext(timestamp), fileList, timestamp);
     }
 
     onAllowDisallowLaunchingClicked() {
@@ -781,7 +781,7 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
             for (let i = 0; i < envS.length; i += 2)
                 context.setenv(envS[i], envS[i + 1]);
 
-            this._doOpenContext(context, null);
+            this._doOpenContext(context, null, timestamp);
             return;
         }
         const title = _('Could not find discrete GPU data');
@@ -941,7 +941,7 @@ export var FileItem = class extends desktopIconItem.desktopIconItem {
                     this._refreshMetadataAsync(true);
                 } catch (error) {
                     if (!error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
-                        const title = _('Failed to set metadata::trusted flag');
+                        const title = _('Failed to set metadata::sandbox flag');
                         const err = error.message;
                         const logError = `${title}: ${err}`;
                         this._logAndPopupError(title, err, logError);

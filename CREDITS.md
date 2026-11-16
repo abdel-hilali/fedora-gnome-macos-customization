@@ -5,45 +5,46 @@ macstyle brings together the work of many people. Thank you to all of them.
 Every part keeps its own licence. The licence texts are in this repository:
 
 - GPL-3.0: [LICENSE](LICENSE)
-- GPL-2.0: [extensions/user-theme@gnome-shell-extensions.gcampax.github.com/COPYING](extensions/user-theme@gnome-shell-extensions.gcampax.github.com/COPYING)
+- GPL-2.0: [extensions-50/user-theme@gnome-shell-extensions.gcampax.github.com/COPYING](extensions-50/user-theme@gnome-shell-extensions.gcampax.github.com/COPYING)
 - AGPL-3.0: [extensions/live-lockscreen@nick-redwill/LICENSE.txt](extensions/live-lockscreen@nick-redwill/LICENSE.txt)
 - MIT: [themes/COPYING.WhiteSur](themes/COPYING.WhiteSur) and [extensions/clipboard-indicator@tudmotu.com/LICENSE.rst](extensions/clipboard-indicator@tudmotu.com/LICENSE.rst)
 - CC-BY-SA-4.0 (wallpapers): <https://creativecommons.org/licenses/by-sa/4.0/>
 
 ## GNOME Shell extensions
 
-These are copied from the projects below into [extensions/](extensions/). Four of them carry our own changes; each change is also kept as a patch in [patches/](patches/).
+These are copied from the projects below. [extensions/](extensions/) holds the ones that work on GNOME 50 and 51; [extensions-50/](extensions-50/) and [extensions-51/](extensions-51/) hold the ones that need a different copy for each version, and the install picks the folder for your GNOME. Five of them carry our own changes; each change is also kept as a patch in [patches/](patches/).
 
 | Extension | Project | Version | Licence |
 |---|---|---|---|
 | AppMenu | <https://github.com/ChathurangaBW/AppMenu> | 15, changed | GPL-3.0 |
-| Blur my Shell | <https://github.com/aunetx/blur-my-shell> | 72 | GPL-3.0 |
-| Caffeine | <https://github.com/eonpatapon/gnome-shell-extension-caffeine> | 60 | GPL-2.0 |
-| Clipboard Indicator | <https://github.com/Tudmotu/gnome-shell-extension-clipboard-indicator> | 71 | MIT |
-| Compiz alike magic lamp effect | <https://github.com/hermes83/compiz-alike-magic-lamp-effect> | 24 | GPL-3.0 |
-| Coverflow Alt-Tab | <https://github.com/dsheeler/CoverflowAltTab> | 88 | GPL-3.0 |
-| Dash2Dock Motion | <https://github.com/Unmade760/dash2dock-motion> | based on Dash to Dock 105, changed | GPL-2.0 |
-| Desktop Icons NG (DING) | <https://gitlab.com/rastersoft/desktop-icons-ng> | 99 | GPL-3.0 |
+| Blur my Shell | <https://github.com/aunetx/blur-my-shell> | 78 | GPL-3.0 |
+| Caffeine | <https://github.com/eonpatapon/gnome-shell-extension-caffeine> | 61 | GPL-2.0 |
+| Clipboard Indicator | <https://github.com/Tudmotu/gnome-shell-extension-clipboard-indicator> | 74 | MIT |
+| Compiz alike magic lamp effect | <https://github.com/hermes83/compiz-alike-magic-lamp-effect> | 25 | GPL-3.0 |
+| Coverflow Alt-Tab | <https://github.com/dsheeler/CoverflowAltTab> | 88 (GNOME 50), 91 (GNOME 51) | GPL-3.0 |
+| Dash2Dock Motion | <https://github.com/Unmade760/dash2dock-motion> | commit `ada4c34` (with Dash to Dock 110), changed | GPL-2.0 |
+| Desktop Icons NG (DING) | <https://gitlab.com/rastersoft/desktop-icons-ng> | 105 | GPL-3.0 |
 | Just Perfection | <https://gitlab.gnome.org/jrahmatzadeh/just-perfection> | 37 | GPL-3.0 |
 | Live Lock Screen | <https://github.com/nick-redwill/LiveLockScreen> | 4.0.2 | AGPL-3.0 |
-| Multi Monitors Bar | <https://github.com/FrederykAbryan/multi-monitors-bar_fapv2> | 54, changed | GPL-2.0 |
-| Rounded Window Corners Reborn | <https://github.com/flexagoon/rounded-window-corners> | 25, changed | GPL-3.0 |
-| Status Area Horizontal Spacing | <https://gitlab.com/p91paul/status-area-horizontal-spacing-gnome-shell-extension> | 32 | GPL-2.0-or-later |
-| Top Bar Organizer Plus | <https://github.com/ShibasishPaul/top-bar-organizer-plus> | 17.2 | GPL-3.0 |
-| Unite | <https://github.com/hardpixel/unite-shell> | 85 | GPL-3.0 |
-| User Themes | <https://gitlab.gnome.org/GNOME/gnome-shell-extensions> | 50.4 | GPL-2.0-or-later |
+| Multi Monitors Bar | <https://github.com/FrederykAbryan/multi-monitors-bar_fapv2> | 62, changed | GPL-2.0 |
+| Rounded Window Corners Reborn | <https://github.com/flexagoon/rounded-window-corners> | 25 (GNOME 50), 26 (GNOME 51), changed | GPL-3.0 |
+| Status Area Horizontal Spacing | <https://gitlab.com/p91paul/status-area-horizontal-spacing-gnome-shell-extension> | 33 | GPL-2.0-or-later |
+| Top Bar Organizer Plus | <https://github.com/ShibasishPaul/top-bar-organizer-plus> | 17.3 | GPL-3.0 |
+| Unite | <https://github.com/hardpixel/unite-shell> | 85, changed | GPL-3.0 |
+| User Themes | <https://gitlab.gnome.org/GNOME/gnome-shell-extensions> | 50.4 (GNOME 50), 51.0 (GNOME 51) | GPL-2.0-or-later |
 | Downloads Fan | this repository (our own) | 0.3 | GPL-2.0-or-later |
 
 Two more extensions come from Fedora packages and are not in this repository: Apps Menu (`gnome-shell-extension-apps-menu`) and Background Logo (`gnome-shell-extension-background-logo`).
 
 ### Our changes
 
-- **AppMenu** ([patches/appmenu-v15-real-menus.patch](patches/appmenu-v15-real-menus.patch)): shows an app's real menus in the top bar. That covers apps that publish them over DBusMenu (VS Code, Chrome, Firefox) and GTK apps that publish their menu bar (LibreOffice and others). Entries are built only when a menu opens, so the bar stays fast.
-- **Dash2Dock Motion** ([patches/dash2dock-motion-local.diff](patches/dash2dock-motion-local.diff)): adds Dash to Dock's own fix for a crash at logout (from Dash to Dock's pull request #2655), a guard for logout, and a lighter dock shadow in light mode.
-- **Multi Monitors Bar** ([patches/multi-monitors-bar-v54.patch](patches/multi-monitors-bar-v54.patch)): the second monitor's bar copies the main bar. It shows the same items in the same order, Unite's window buttons work on it, and it gets the same blur. The overview on the second monitor is laid out like the one on the main monitor.
-- **Rounded Window Corners Reborn** ([patches/rwc-v25-local.diff](patches/rwc-v25-local.diff)): a window minimized while the overview was open gets its rounded corners back when it returns.
+- **AppMenu** ([patches/appmenu-v15-real-menus.patch](patches/appmenu-v15-real-menus.patch)): shows an app's real menus in the top bar. That covers apps that publish them over DBusMenu (VS Code, Chrome, Firefox) and GTK apps that publish their menu bar (LibreOffice and others). Entries are built only when a menu opens, so the bar stays fast. A second patch ([patches/appmenu-v15-gnome51.patch](patches/appmenu-v15-gnome51.patch)) makes it run on GNOME 51 as well as 50.
+- **Dash2Dock Motion** ([patches/dash2dock-motion-local.diff](patches/dash2dock-motion-local.diff)): a guard for logout, and a lighter dock shadow in light mode. (Dash to Dock's own fix for a crash at logout, which we used to add, is now part of the project.)
+- **Multi Monitors Bar** ([patches/multi-monitors-bar-v62.patch](patches/multi-monitors-bar-v62.patch)): the second monitor's bar copies the main bar. It shows the same items in the same order, Unite's window buttons work on it, and it gets the same blur. The overview on the second monitor is laid out like the one on the main monitor.
+- **Rounded Window Corners Reborn** ([patches/rwc-v25-local.diff](patches/rwc-v25-local.diff) for GNOME 50, [patches/rwc-v26-local.diff](patches/rwc-v26-local.diff) for GNOME 51): a window minimized while the overview was open gets its rounded corners back when it returns.
+- **Unite** ([patches/unite-v85-local.diff](patches/unite-v85-local.diff)): runs on GNOME 51 too, and swaps its window-button style only after GNOME has finished restyling the top bar. Swapping it during that step crashed GNOME Shell when a window was maximized together with Blur my Shell 78.
 
-These four copies have no version number in `metadata.json`, so extensions.gnome.org never replaces them with the unchanged versions.
+These five copies have no version number in `metadata.json`, so extensions.gnome.org never replaces them with the unchanged versions.
 
 ## Themes, icons and cursor
 

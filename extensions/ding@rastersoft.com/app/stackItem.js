@@ -97,7 +97,10 @@ export var stackItem = class extends desktopIconItem.desktopIconItem {
 
     setAccessibleName(filename) {
         const isExpanded = Prefs.getUnstackList().includes(this.attributeContentType);
-        this._accessibleBox.update_property([Gtk.AccessibleProperty.LABEL, Gtk.AccessibleProperty.DESCRIPTION], [filename, '']);
+        /** TRANSLATORS: when using a screen reader, this is the role used when a file group is
+         * highlighted (when 'keep sorted by group' is enabled). Example: if a group named
+         * "jpeg" is highlighted, it will say "jpeg group". It is mandatory to say the file name first, then the "group" role. */
+        this._accessibleBox.update_property([Gtk.AccessibleProperty.LABEL, Gtk.AccessibleProperty.DESCRIPTION], [_('{VisibleName} Group').replace('{VisibleName}', filename), '']);
         this._accessibleBox.update_state([Gtk.AccessibleState.CHECKED], [isExpanded ? Gtk.AccessibleTristate.TRUE : Gtk.AccessibleTristate.FALSE]);
     }
 

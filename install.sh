@@ -24,7 +24,10 @@ REPO="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$REPO/lib/common.sh"
 
-TESTED_GNOME=50
+# GNOME versions this is made for: 50 (Fedora 44) and 51 (Fedora 45). extensions/ works on both;
+# extensions-50/ and extensions-51/ hold the extensions that need a different copy per version.
+SUPPORTED_GNOME=(50 51)
+GNOME_SET=""   # set by preflight: the extensions-NN folder used on this computer
 ICONS_COMMIT=839848b9a8a38a92a6936e30c4abe35cc6f2546d   # MacTahoe icon theme, 2026-09-10
 ICONS_URL="https://github.com/vinceliuice/MacTahoe-icon-theme/archive/$ICONS_COMMIT.tar.gz"
 # The terminal: JetBrains Mono with Nerd Font icons, and Powerlevel10k (the prompt engine).
@@ -71,10 +74,19 @@ preflight() {
     fi
     command -v gnome-shell >/dev/null || die "GNOME Shell is not installed. This needs Fedora Workstation (GNOME)."
     local gv; gv="$(gnome-shell --version | awk '{split($3, v, "."); print v[1]}')"
-    if [[ "$gv" != "$TESTED_GNOME" ]]; then
-        [[ $FORCE = 1 ]] || die "tested on GNOME $TESTED_GNOME (Fedora 44); this computer has GNOME $gv. Some extensions may not load. Use --force to try anyway."
-        warn "GNOME $gv is not tested; going on because of --force"
+    if [[ " ${SUPPORTED_GNOME[*]} " == *" $gv "* ]]; then
+        GNOME_SET="$gv"
+    else
+        [[ $FORCE = 1 ]] || die "made for GNOME 50 (Fedora 44) and GNOME 51 (Fedora 45); this computer has GNOME ${gv:-?}. Some extensions may not load. Use --force to try anyway."
+        # The closest supported version's copies.
+        if [[ "$gv" =~ ^[0-9]+$ && "$gv" -lt "${SUPPORTED_GNOME[0]}" ]]; then
+            GNOME_SET="${SUPPORTED_GNOME[0]}"
+        else
+            GNOME_SET="${SUPPORTED_GNOME[-1]}"
+        fi
+        warn "GNOME ${gv:-?} is not tested; going on because of --force, with the extensions for GNOME $GNOME_SET"
     fi
+    [[ -d "$REPO/extensions-$GNOME_SET" ]] || die "$REPO/extensions-$GNOME_SET is missing. Run install.sh inside the folder you cloned with git."
     [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] ||
         die "run it from a terminal inside your GNOME desktop (not over SSH or from a text console)."
     for c in dconf gsettings python3 systemctl gio curl tar; do
@@ -184,15 +196,22 @@ print(json.dumps(data, indent=2))')"
     fi
 }
 
+# The extension folders for this computer: the shared ones, then the ones for its GNOME version.
+extension_dirs() {
+    local dir
+    for dir in "$REPO"/extensions/*/ "$REPO/extensions-$GNOME_SET"/*/; do
+        printf '%s\n' "${dir%/}"
+    done
+}
+
 extensions() {
     step "GNOME extensions"
-    local dir uuid count=0
-    for dir in "$REPO"/extensions/*/; do
-        uuid="$(basename -- "$dir")"
-        put "${dir%/}" "$EXT_DIR/$uuid"
+    local dir count=0
+    while IFS= read -r dir; do
+        put "$dir" "$EXT_DIR/$(basename -- "$dir")"
         count=$((count + 1))
-    done
-    ok "$count extensions copied to $EXT_DIR"
+    done < <(extension_dirs)
+    ok "$count extensions for GNOME $GNOME_SET copied to $EXT_DIR"
 }
 
 themes() {
@@ -339,7 +358,7 @@ settings() {
     ok "window buttons on the left, themes, icons and cursor"
     launcher
     local uuids=() dir
-    for dir in "$REPO"/extensions/*/; do uuids+=("$(basename -- "$dir")"); done
+    while IFS= read -r dir; do uuids+=("$(basename -- "$dir")"); done < <(extension_dirs)
     gsettings set org.gnome.shell disable-user-extensions false
     python3 -I "$REPO/lib/dconf-tool.py" enable "${uuids[@]}" "${RPM_EXTENSIONS[@]}" \
         --disable "${CONFLICTING_EXTENSIONS[@]}"

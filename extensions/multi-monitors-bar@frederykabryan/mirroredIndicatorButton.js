@@ -16,6 +16,7 @@ along with this program; if not, visit https://www.gnu.org/licenses/.
 */
 
 import { retainAstraSourceHeight } from './astraSourceGeometry.js';
+import { sourceIsVisible } from './monitorIndicatorPolicy.js';
 import St from 'gi://St';
 import Atk from 'gi://Atk';
 import Clutter from 'gi://Clutter';
@@ -26,6 +27,13 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+import { setBoxVertical, shellVersion } from './common.js';
+
+// The Workspace Indicator stylesheet fixes .status-label at 8em, wider than
+// a side bar, so side bars use a class of their own for the name.
+function workspaceNameClass(vertical) {
+    return vertical ? 'mm-workspace-name' : 'status-label';
+}
 
 const MMWorkspacePreviewLayout = GObject.registerClass(
     class MMWorkspacePreviewLayout extends Clutter.LayoutManager {
@@ -44,7 +52,7 @@ const MMWorkspacePreviewLayout = GObject.registerClass(
                 const fallbackBox = new Clutter.ActorBox();
                 fallbackBox.set_origin(0, 0);
                 fallbackBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
-                for (const child of container.get_children ? container.get_children() : [])
+                for (const child of container.get_children())
                     child.allocate(fallbackBox);
                 return;
             }
@@ -56,12 +64,12 @@ const MMWorkspacePreviewLayout = GObject.registerClass(
                 const fallbackBox = new Clutter.ActorBox();
                 fallbackBox.set_origin(0, 0);
                 fallbackBox.set_size(Math.max(1, box.get_width()), Math.max(1, box.get_height()));
-                for (const child of container.get_children ? container.get_children() : [])
+                for (const child of container.get_children())
                     child.allocate(fallbackBox);
                 return;
             }
 
-            const children = container.get_children ? container.get_children() : [];
+            const children = container.get_children();
 
             for (const child of children) {
                 if (!child.metaWindow) {
@@ -101,6 +109,12 @@ export const MirroredIndicatorButton = GObject.registerClass(
             this._role = role;
             this._panel = panel;
 
+            // Clean up from the destroy signal, not a destroy() override:
+            // when the parent panel is torn down, Clutter destroys this
+            // button without calling the JS override, which left source
+            // handlers pointing at a disposed object.
+            this.connect('destroy', () => this._cleanup());
+
             if (role === 'activities') {
                 this._initActivitiesButton();
             } else {
@@ -119,11 +133,12 @@ export const MirroredIndicatorButton = GObject.registerClass(
             this.y_expand = true;
             this.y_align = Clutter.ActorAlign.FILL;
 
-            // Container for workspace dots - centered vertically
+            // Container for workspace dots - centered vertically and horizontally
             this._workspaceDotsBox = new St.BoxLayout({
                 style_class: 'workspace-dots',
                 y_align: Clutter.ActorAlign.CENTER,
                 x_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
                 y_expand: true,
             });
 
@@ -165,17 +180,37 @@ export const MirroredIndicatorButton = GObject.registerClass(
 
             const nWorkspaces = this._workspaceManager.n_workspaces;
             const activeIndex = this._workspaceManager.get_active_workspace_index();
+            const vertical = this._workspaceVertical ?? !!this._panel?._vertical;
 
             for (let i = 0; i < nWorkspaces; i++) {
                 const isActive = (i === activeIndex);
+                const bgColor = isActive ? '#ffffff' : 'rgba(255, 255, 255, 0.4)';
                 const dot = new St.Widget({
                     style_class: isActive ? 'workspace-dot active' : 'workspace-dot',
-                    width: isActive ? 34 : 7,
-                    height: isActive ? 8 : 7,
-                    style: `border-radius: 6px; background-color: rgba(255, 255, 255, ${isActive ? '1' : '0.5'}); margin: 0 2px;`,
+                    width: vertical ? (isActive ? 32 : 8) : (isActive ? 34 : 7),
+                    height: vertical ? (isActive ? 10 : 8) : (isActive ? 8 : 7),
+                    style: `border-radius: 6px; background-color: ${bgColor}; margin: ${vertical ? '2px 0' : '0 2px'};`,
+                    x_align: Clutter.ActorAlign.CENTER,
                     y_align: Clutter.ActorAlign.CENTER,
                 });
                 this._workspaceDotsBox.add_child(dot);
+            }
+        }
+
+        _syncPanelOrientation(vertical) {
+            if (this._workspaceVertical === vertical)
+                return;
+            this._workspaceVertical = vertical;
+            if (this._role === 'activities')
+                this._updateWorkspaceDots();
+            if (this._workspaceNameIcon)
+                this._workspaceNameIcon.visible = !vertical;
+            this._workspaceNameLabel?.set_style_class_name(workspaceNameClass(vertical));
+            if (this._workspacePreviewBox) {
+                // A side bar needs one full-height thumbnail per workspace.
+                this.set_height(vertical ? -1 : 30);
+                setBoxVertical(this._workspacePreviewBox, vertical);
+                this._updateWorkspacePreviewMirror();
             }
         }
 
@@ -184,21 +219,21 @@ export const MirroredIndicatorButton = GObject.registerClass(
             this._isEmpty = false;
 
             if (this._sourceIndicator) {
-                this._sourceDestroyId = this._sourceIndicator.connect('destroy', () => {
-                    this._sourceDestroyId = 0;
-                    // Tear down while the source still exists, before its children
-                    // and clones are disposed by Clutter.
-                    this.destroy();
-                });
+                // Tear down while the source still exists, before its children
+                // and clones are disposed by Clutter. Tied to this button so
+                // it is disconnected however the button gets destroyed.
+                this._sourceIndicator.connectObject('destroy',
+                    () => this.destroy(), this);
                 // Check if the source indicator has any visible content
                 const sourceChild = this._sourceIndicator.get_first_child();
                 if (!sourceChild) {
                     this._markEmpty();
                     return;
                 }
+                this._loadUnmappedAppIndicatorIcons(sourceChild);
 
                 // Additional check: if the source indicator or its child is not visible, skip
-                if (!this._sourceIndicator.visible) {
+                if (!sourceIsVisible(this._sourceIndicator)) {
                     this._markEmpty();
                     return;
                 }
@@ -223,6 +258,8 @@ export const MirroredIndicatorButton = GObject.registerClass(
         _markEmpty() {
             this._isEmpty = true;
             this.visible = false;
+            if (this.container)
+                this.container.visible = false;
             this.reactive = false;
             this.can_focus = false;
             this.track_hover = false;
@@ -272,7 +309,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 return;
 
             const sourceChild = this._sourceIndicator.get_first_child();
-            const hasContent = this._sourceIndicator.visible &&
+            const hasContent = sourceIsVisible(this._sourceIndicator) &&
                 sourceChild &&
                 this._hasVisibleRenderableSourceContent(sourceChild);
             // A hidden container hides the item without emptying it: the
@@ -290,6 +327,8 @@ export const MirroredIndicatorButton = GObject.registerClass(
 
             this._isEmpty = !hasContent;
             this.visible = shown;
+            if (this.container)
+                this.container.visible = shown;
             this.reactive = shown;
             this.can_focus = shown;
             this.track_hover = shown;
@@ -300,7 +339,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 return false;
 
             if (actor instanceof St.Icon)
-                return !!actor.gicon || !!actor.icon_name;
+                return !!actor.gicon || !!actor.icon_name || !!actor.content;
 
             if (actor instanceof St.Label)
                 return !!actor.text && actor.text.trim().length > 0;
@@ -308,7 +347,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (actor instanceof Clutter.Clone)
                 return true;
 
-            const children = actor.get_children ? actor.get_children() : [];
+            const children = actor.get_children();
             if (children.length === 0)
                 return true;
 
@@ -479,21 +518,26 @@ export const MirroredIndicatorButton = GObject.registerClass(
             const statusBox = new St.BoxLayout();
 
             const label = new St.Label({
-                style_class: 'status-label',
+                style_class: workspaceNameClass(!!this._panel?._vertical),
                 y_align: Clutter.ActorAlign.CENTER,
                 text: sourceMenu.activeName,
             });
             statusBox.add_child(label);
 
-            statusBox.add_child(new St.Icon({
+            // A side bar stacks the box, so the dropdown arrow would sit under
+            // the name, thickening the pill; hide it there.
+            const icon = new St.Icon({
                 icon_name: 'pan-down-symbolic',
                 style_class: 'system-status-icon',
-            }));
+                visible: !this._panel?._vertical,
+            });
+            statusBox.add_child(icon);
 
             wrapper.add_child(statusBox);
             this.add_child(wrapper);
 
             this._workspaceNameLabel = label;
+            this._workspaceNameIcon = icon;
             this._workspaceNameStatusBox = statusBox;
 
             this._workspaceNameLabelChangedId = sourceMenu.connect(
@@ -574,6 +618,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 this._workspaceNameLabelChangedId = 0;
             }
             this._workspaceNameLabel = null;
+            this._workspaceNameIcon = null;
             this._workspaceNameStatusBox = null;
 
             if (this._workspacePreviewUpdateId) {
@@ -618,7 +663,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
         }
 
         _createWorkspacePreviewMirror() {
-            this.set_height(30);
+            this.set_height(this._panel?._vertical ? -1 : 30);
 
             this._workspacePreviewBox = new St.BoxLayout({
                 style_class: 'workspaces-box',
@@ -626,6 +671,9 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 y_align: Clutter.ActorAlign.FILL,
                 x_expand: false,
             });
+            // Stack thumbnails on a side bar; a row would be shrunk to fit.
+            setBoxVertical(this._workspacePreviewBox,
+                this._workspaceVertical ?? !!this._panel?._vertical);
 
             this.add_child(this._workspacePreviewBox);
             this._connectWorkspacePreviewSignals();
@@ -710,13 +758,14 @@ export const MirroredIndicatorButton = GObject.registerClass(
         }
 
         _createWorkspacePreviewThumbnail(index, active) {
+            const vertical = this._workspaceVertical ?? !!this._panel?._vertical;
             const thumbnail = new St.Button({
                 reactive: false,
                 y_expand: true,
                 y_align: Clutter.ActorAlign.FILL,
                 x_expand: false,
             });
-            thumbnail.set_size(62, 30);
+            thumbnail.set_size(vertical ? 54 : 62, vertical ? 42 : 30);
             thumbnail._mmWorkspaceIndex = index;
 
             const box = new St.BoxLayout({
@@ -737,7 +786,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.FILL,
             });
-            previewLayer.set_size(52, 18);
+            previewLayer.set_size(vertical ? 44 : 52, vertical ? 28 : 18);
 
             const preview = new St.Bin({
                 style_class: active ? 'workspace active' : 'workspace',
@@ -746,7 +795,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 y_align: Clutter.ActorAlign.FILL,
                 x_expand: false,
             });
-            preview.set_size(52, 18);
+            preview.set_size(vertical ? 44 : 52, vertical ? 28 : 18);
 
             box.add_child(preview);
             this._populateWorkspacePreviewLayer(previewLayer, index, active);
@@ -886,6 +935,9 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (width > 0 && height > 0)
                 return [width, height];
 
+            if (!actor.get_stage())
+                return [0, 0];
+
             const [, natWidth] = actor.get_preferred_width(-1);
             const [, natHeight] = actor.get_preferred_height(-1);
             return [Math.round(natWidth), Math.round(natHeight)];
@@ -970,7 +1022,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             this.reactive = false;
             this.track_hover = false;
             
-            const children = source.get_children ? source.get_children() : [];
+            const children = source.get_children();
             if (children.length === 0) {
                 // Base clone fallback if structure not as expected
                 this._createAllocationMatchedClone(root, source, true);
@@ -986,7 +1038,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 const proxy = new St.Button({
                     reactive: child.reactive !== false, 
                     track_hover: child.track_hover !== false,
-                    style_class: child.get_style_class_name ? child.get_style_class_name() : 'panel-button',
+                    style_class: child instanceof St.Widget ? child.get_style_class_name() : 'panel-button',
                     y_expand: true,
                     y_align: Clutter.ActorAlign.FILL,
                     x_expand: child.x_expand !== false,
@@ -1161,7 +1213,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                         const result = vfunc.call(targetChild, event);
                         if (result === Clutter.EVENT_STOP) handled = true;
                     }
-                    if (!handled && typeof targetChild.emit === 'function') {
+                    if (!handled) {
                         targetChild.emit(eventName, event);
                         handled = true;
                     }
@@ -1528,6 +1580,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                     GLib.source_remove(this._iconSyncId);
                     this._iconSyncId = null;
                 }
+                this._iconSyncSignature = null;
             });
         }
 
@@ -1626,16 +1679,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (widgets.length > 0) {
                 for (const widget of widgets) {
                     if (widget instanceof St.Icon) {
-                        const iconCopy = new St.Icon({
-                            gicon: widget.gicon,
-                            icon_name: widget.icon_name,
-                            icon_size: this._getSourceIconSize(widget),
-                            style_class: widget.get_style_class_name() || 'system-status-icon',
-                            x_align: Clutter.ActorAlign.CENTER,
-                            y_align: Clutter.ActorAlign.CENTER,
-                            x_expand: false,
-                            y_expand: false,
-                        });
+                        const iconCopy = this._createDisplayWidgetCopy(widget);
                         container.add_child(iconCopy);
                     } else if (widget instanceof St.Label) {
                         // Skip labels for ArcMenu and Clipboard indicators
@@ -1668,9 +1712,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
 
         _createDisplayWidgetCopy(widget) {
             if (widget instanceof St.Icon) {
-                return new St.Icon({
-                    gicon: widget.gicon,
-                    icon_name: widget.icon_name,
+                const iconCopy = new St.Icon({
                     icon_size: this._getSourceIconSize(widget),
                     style_class: widget.get_style_class_name() || 'system-status-icon',
                     x_align: Clutter.ActorAlign.CENTER,
@@ -1678,6 +1720,29 @@ export const MirroredIndicatorButton = GObject.registerClass(
                     x_expand: false,
                     y_expand: false,
                 });
+
+                // Follow the source icon live. Tray providers (AppIndicator
+                // pixmaps from Electron apps, issue #59) swap in GIcons that
+                // cannot be serialized, so the poll signature alone can miss
+                // the change and a one-shot copy would stay stuck. Never
+                // overwrite a GIcon with icon_name: a null icon-name would
+                // clear the copy's gicon. Handlers go away with the copy.
+                const syncIcon = () => {
+                    if (widget.gicon)
+                        iconCopy.gicon = widget.gicon;
+                    else
+                        iconCopy.icon_name = widget.icon_name;
+                    iconCopy.icon_size = this._getSourceIconSize(widget);
+                };
+                syncIcon();
+                widget.connectObject(
+                    'notify::gicon', syncIcon,
+                    'notify::icon-name', syncIcon,
+                    'notify::icon-size', syncIcon,
+                    iconCopy);
+                this._refreshUnmappedAppIndicatorIcon(widget, iconCopy);
+
+                return iconCopy;
             }
 
             if (widget instanceof St.Label) {
@@ -1688,6 +1753,51 @@ export const MirroredIndicatorButton = GObject.registerClass(
             }
 
             return null;
+        }
+
+        _refreshUnmappedAppIndicatorIcon(sourceIcon, iconCopy) {
+            // AppIndicator's icon actor ignores icon changes while it is
+            // unmapped, which it is whenever a fullscreen window hides the
+            // primary panel (issue #59). Mirrors on other monitors are still
+            // visible, so refresh the source ourselves; its new gicon then
+            // reaches the copy through the notify handlers. This relies on
+            // AppIndicator internals, so do nothing if they are not there.
+            const indicator = sourceIcon._indicator;
+            if (typeof indicator?.connectObject !== 'function' ||
+                typeof sourceIcon._updateIcon !== 'function')
+                return;
+
+            const refresh = () => {
+                if (sourceIcon.is_mapped() || !sourceIcon._indicator)
+                    return;
+                Promise.resolve(sourceIcon._updateIcon()).catch(e =>
+                    console.debug(`[MultiMonitors] AppIndicator refresh failed: ${e}`));
+            };
+            indicator.connectObject(
+                'icon', refresh,
+                'overlay-icon', refresh,
+                iconCopy);
+        }
+
+        _loadUnmappedAppIndicatorIcons(actor) {
+            // AppIndicator only loads a new icon actor's first icon once it is
+            // mapped. After unlock the tray icons are recreated on a primary
+            // panel hidden by a fullscreen window, so they stay blank, this
+            // mirror looks empty and is dropped (issue #63). Load them
+            // ourselves; the panel rebuilds the mirror on the new gicon.
+            const walk = node => {
+                if (node instanceof St.Icon) {
+                    if (!node.gicon && !node.is_mapped() && node._indicator &&
+                        typeof node._updateIcon === 'function') {
+                        Promise.resolve(node._updateIcon()).catch(e =>
+                            console.debug(`[MultiMonitors] AppIndicator load failed: ${e}`));
+                    }
+                    return;
+                }
+                for (const child of node.get_children())
+                    walk(child);
+            };
+            walk(actor);
         }
 
         _createLabelCopy(sourceLabel) {
@@ -1792,39 +1902,44 @@ export const MirroredIndicatorButton = GObject.registerClass(
         }
 
         _syncStaticCopyContainerSize(container, source) {
+            // Clipboard and icon-only indicators (e.g. Tiling Shell) keep the
+            // copied icon's natural size. Mirroring the source button's raw
+            // allocation makes the icon look off-center, and freezing a
+            // measured size leaves the icon squeezed to zero width once a side
+            // bar restyles and stacks the copy (the size was taken before the
+            // icon's themed icon-size applied).
+            if (this._isClipboardIndicator() || source instanceof St.Icon)
+                return;
+
             const syncSize = () => {
-                if (this._isClipboardIndicator()) {
-                    const [minWidth, natWidth] = container.get_preferred_width(-1);
-                    const [, natHeight] = container.get_preferred_height(-1);
-                    const width = Math.round(natWidth || minWidth);
-                    const height = Math.round(natHeight);
-
-                    if (width > 0 && height > 0)
-                        container.set_size(width, height);
+                // An unmapped source (primary panel hidden by a fullscreen
+                // window) is not laid out again, so its allocation goes stale.
+                // After unlock it was taken during the moment the lock screen
+                // showed the panel, before the labels got text: pinning it
+                // squeezed the label copies to nothing (issue #63). Let the
+                // copy follow its own content until the source is shown again.
+                if (!source.mapped) {
+                    container.set_size(-1, -1);
                     return;
                 }
-
-                // Icon-only indicators (e.g. Tiling Shell) can have asymmetric
-                // allocation from the source button wrapper. Mirroring that raw
-                // allocation width makes the icon look off-center on secondary
-                // panels, so use the copied icon's natural size instead.
-                if (source instanceof St.Icon) {
-                    const [minWidth, natWidth] = container.get_preferred_width(-1);
-                    const [, natHeight] = container.get_preferred_height(-1);
-                    const width = Math.round(natWidth || minWidth);
-                    const height = Math.round(natHeight);
-
-                    if (width > 0 && height > 0)
-                        container.set_size(width, height);
-                    return;
-                }
-
                 const [width, height] = this._getActorAllocationSize(source);
                 if (width > 0 && height > 0)
                     container.set_size(width, height);
             };
+            source.connectObject('notify::mapped', syncSize, container);
 
-            syncSize();
+            // Measuring off-stage logs "st_widget_get_theme_node called on the
+            // widget [...] which is not in the stage"; wait for the first map.
+            if (container.get_stage()) {
+                syncSize();
+            } else {
+                container.connectObject('notify::mapped', () => {
+                    if (!container.mapped)
+                        return;
+                    container.disconnectObject(this);
+                    syncSize();
+                }, this);
+            }
 
             const allocationId = source.connect('notify::allocation', syncSize);
             if (!this._allocationCloneSignals)
@@ -1839,7 +1954,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (actor instanceof St.Icon || actor instanceof St.Label) {
                 widgets.push(actor);
             }
-            const children = actor.get_children ? actor.get_children() : [];
+            const children = actor.get_children();
             for (const child of children) {
                 widgets.push(...this._findAllDisplayWidgets(child));
             }
@@ -1859,7 +1974,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (actor instanceof St.Label)
                 return !!actor.text && actor.text.trim().length > 0;
 
-            const children = actor.get_children ? actor.get_children() : [];
+            const children = actor.get_children();
             for (const child of children) {
                 if (this._hasRenderableMirrorContent(child))
                     return true;
@@ -1874,23 +1989,85 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 this._iconSyncId = null;
             }
 
-            // Full rebuild every 5 seconds to catch added/removed icons
+            // Poll every 5 seconds to catch added/removed icons, but only
+            // rebuild when the source tree actually changed. An unconditional
+            // rebuild destroys and recreates every mirrored icon, which shows
+            // up as a periodic flicker on the secondary panels.
             this._iconSyncId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
                 if (!this._iconContainer || !this._iconSource) {
                     this._iconSyncId = null;
+                    this._iconSyncSignature = null;
                     return GLib.SOURCE_REMOVE;
                 }
 
-                this._copyIconsFromSource(this._iconContainer, this._iconSource);
+                const signature = this._mirrorSourceSignature(this._iconSource);
+                if (signature !== this._iconSyncSignature) {
+                    this._iconSyncSignature = signature;
+                    this._copyIconsFromSource(this._iconContainer, this._iconSource);
+                }
+
                 return GLib.SOURCE_CONTINUE;
             });
+        }
+
+        // Structural fingerprint of the mirrored source: icon names/gicons,
+        // icon sizes, label texts, visibility and per-level child counts.
+        // Cheap enough to run on every poll and stable while nothing changes.
+        _mirrorSourceSignature(actor) {
+            const parts = [];
+
+            const walk = node => {
+                if (!node)
+                    return;
+
+                if (node.visible === false) {
+                    parts.push('h');
+                    return;
+                }
+
+                if (node instanceof St.Icon) {
+                    const id = node.icon_name || this._gIconSignatureId(node.gicon);
+                    parts.push(`i:${id}:${node.icon_size || 0}`);
+                } else if (node instanceof St.Label) {
+                    parts.push(`l:${node.text || ''}`);
+                }
+
+                const children = node.get_children();
+                parts.push(`(${children.length}`);
+                for (const child of children)
+                    walk(child);
+                parts.push(')');
+            };
+
+            walk(actor);
+            return parts.join('|');
+        }
+
+        _gIconSignatureId(gicon) {
+            if (!gicon)
+                return '';
+
+            const serialized = gicon.to_string();
+            if (serialized)
+                return serialized;
+
+            // Pixmap-backed GIcons (GdkPixbuf, BytesIcon) have no string form;
+            // fall back to object identity so replacing one changes the signature.
+            this._gIconIds ??= new WeakMap();
+            let id = this._gIconIds.get(gicon);
+            if (!id) {
+                this._gIconIdCounter = (this._gIconIdCounter ?? 0) + 1;
+                id = `obj${this._gIconIdCounter}`;
+                this._gIconIds.set(gicon, id);
+            }
+            return id;
         }
 
         _createFillClone(parent, source) {
             // For favorites-menu@fthx - create real widget copy instead of Clutter.Clone
             // This prevents visual glitches when the main panel hides during fullscreen
             const container = new St.BoxLayout({
-                style_class: source.get_style_class_name ? source.get_style_class_name() : 'panel-status-menu-box',
+                style_class: source instanceof St.Widget ? source.get_style_class_name() : 'panel-status-menu-box',
                 x_align: Clutter.ActorAlign.CENTER,
                 y_align: Clutter.ActorAlign.CENTER,
                 y_expand: true,
@@ -1927,7 +2104,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             if (actor instanceof St.Icon) {
                 return actor;
             }
-            const children = actor.get_children ? actor.get_children() : [];
+            const children = actor.get_children();
             for (const child of children) {
                 const found = this._findIconInActor(child);
                 if (found) return found;
@@ -2316,7 +2493,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
             const originalSourceActor = menu.sourceActor;
             const originalBoxPointer = menu.box?._sourceActor;
             const primeSourceActor = originalSourceActor || this._sourceIndicator;
-            const noAnimation = BoxPointer.PopupAnimation?.NONE ?? 0;
+            const noAnimation = shellVersion >= 51 ? { animate: false } : (BoxPointer.PopupAnimation?.NONE ?? 0);
 
             for (const actor of [menu.box, menu._boxPointer]) {
                 if (!actor)
@@ -3058,7 +3235,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
 
             // 2. Handle constraints
             const removedConstraints = [];
-            const constraints = menuBox.get_constraints ? menuBox.get_constraints() : [];
+            const constraints = menuBox.get_constraints();
             for (let constraint of constraints) {
                 if (constraint.constructor.name === 'BindConstraint' ||
                     constraint.constructor.name === 'AlignConstraint') {
@@ -3223,6 +3400,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 GLib.source_remove(this._iconSyncId);
                 this._iconSyncId = null;
             }
+            this._iconSyncSignature = null;
 
             if (this._arcMenuTimeoutId) {
                 GLib.source_remove(this._arcMenuTimeoutId);
@@ -3346,6 +3524,7 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 this._workspaceNameLabelChangedId = 0;
             }
             this._workspaceNameLabel = null;
+            this._workspaceNameIcon = null;
             this._workspaceNameStatusBox = null;
 
             if (this._workspaceMenuRestoreId) {
@@ -3418,18 +3597,10 @@ export const MirroredIndicatorButton = GObject.registerClass(
                 }
             }
 
-            if (this._sourceDestroyId)
-                this._sourceIndicator?.disconnect(this._sourceDestroyId);
-            this._sourceDestroyId = 0;
             this._quickSettingsSource = null;
             this._quickSettingsClone = null;
             this._sourceIndicator = null;
             this._panel = null;
             this._workspaceManager = null;
-        }
-
-        destroy() {
-            this._cleanup();
-            super.destroy();
         }
     });

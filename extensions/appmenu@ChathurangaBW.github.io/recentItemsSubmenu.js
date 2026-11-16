@@ -617,7 +617,7 @@ export const RecentItemsSubmenu = GObject.registerClass(
   _getPointerPosition() {
     // GNOME 45+ deprecated global.get_pointer(); use modern seat API
     try {
-      const seat = Clutter.get_default_backend().get_default_seat();
+      const seat = global.stage.context.get_backend().get_default_seat();
       const device = seat.get_pointer();
       const [, x, y] = device.get_coords();
       return [x, y];

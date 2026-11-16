@@ -43,4 +43,5 @@ export const PrefsFields = {
     SHOW_PIN_BUTTON                 : 'show-pin-button',
     SHOW_EDIT_BUTTON                : 'show-edit-button',
     SHOW_PREVIEW_BUTTON             : 'show-preview-button',
+    IMPORT_HISTORY_FROM             : 'import-history-from',
 };

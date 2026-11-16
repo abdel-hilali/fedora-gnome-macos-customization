@@ -476,6 +476,23 @@ class DbusOperationsManager {
         );
     }
 
+    ShowFolderRemote(folderToShow, timestamp, callback) {
+        if (!this.freeDesktopFileManager.proxy) {
+            this._sendNoProxyError(callback);
+            return;
+        }
+        this.freeDesktopFileManager.proxy.ShowFoldersRemote([folderToShow],
+            this._getStartupId([folderToShow], timestamp),
+            (result, error) => {
+                if (callback)
+                    callback(result, error);
+
+                if (error)
+                    console.log(`Error showing folder on desktop: ${error.message}`);
+            }
+        );
+    }
+
     ShowItemsRemote(showInFilesList, timestamp, callback) {
         if (!this.freeDesktopFileManager.proxy) {
             this._sendNoProxyError(callback);

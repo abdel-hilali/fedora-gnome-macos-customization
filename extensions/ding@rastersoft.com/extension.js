@@ -157,9 +157,10 @@ export default class DING extends Extension {
             () => this.updateDesktopGeometry());
 
         this.data.isEnabled = true;
-        if (this.data.launchDesktopId)
+        if (this.data.launchDesktopId) {
             GLib.source_remove(this.data.launchDesktopId);
-
+            this.data.launchDesktopId = 0;
+        }
 
         this.data.dbusConnectionId = Gio.bus_own_name(Gio.BusType.SESSION, 'com.rastersoft.dingextension', Gio.BusNameOwnerFlags.NONE, null, connection => {
             this.data.dbusConnection = connection;
@@ -260,10 +261,11 @@ export default class DING extends Extension {
     doRelaunch(reloadTime) {
         this.data.currentProcess = null;
         this.data.x11Manager.setWaylandClient(null);
+        if (this.data.launchDesktopId) {
+            GLib.source_remove(this.data.launchDesktopId);
+            this.data.launchDesktopId = 0;
+        }
         if (this.data.isEnabled) {
-            if (this.data.launchDesktopId)
-                GLib.source_remove(this.data.launchDesktopId);
-
             this.data.launchDesktopId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, reloadTime, () => {
                 this.data.launchDesktopId = 0;
                 this.launchDesktop();

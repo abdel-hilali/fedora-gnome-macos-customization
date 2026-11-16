@@ -1,0 +1,66 @@
+diff --git a/unite@hardpixel.eu/metadata.json b/unite@hardpixel.eu/metadata.json
+index dc67a43..3749b54 100644
+--- a/unite@hardpixel.eu/metadata.json
++++ b/unite@hardpixel.eu/metadata.json
+@@ -1,13 +1,21 @@
+ {
+-  "shell-version": ["45", "46", "47", "48", "49", "50"],
++  "shell-version": [
++    "45",
++    "46",
++    "47",
++    "48",
++    "49",
++    "50",
++    "51"
++  ],
+   "uuid": "unite@hardpixel.eu",
+   "url": "https://github.com/hardpixel/unite-shell",
+   "settings-schema": "org.gnome.shell.extensions.unite",
+   "gettext-domain": "unite",
+-  "version": 85,
+   "name": "Unite",
+   "description": "Unite is a GNOME Shell extension which makes a few layout tweaks to the top panel and removes window decorations to make it look like the Unity Shell.\n\n- Adds window buttons to the top panel for maximized windows.\n- Shows current window title in the app menu for maximized windows.\n- Removes titlebars on maximized windows.\n- Hides window controls on maximized windows with headerbars.\n- Moves the date to the right, reduces panel spacing and removes dropdown arrows.\n- Moves legacy tray icons to the top panel.\n- Moves notifications to the right.\n- Hides workspace switcher button.\n- Adds desktop name to the top panel.\n\nThis extension depends on some Xorg utilities. To install them:\n- Debian/Ubuntu: apt install x11-utils\n- Fedora/RHEL: dnf install xprop\n- Arch and derivatives: pacman -S xorg-xprop\n\n*Settings are provided to enable/disable or customize the available tweaks.\n* Since version 2, applications on Wayland with client side decorations are supported using CSS.",
+   "donations": {
+     "github": "jonian"
+-  }
++  },
++  "version-name": "85-macstyle"
+ }
+diff --git a/unite@hardpixel.eu/panel.js b/unite@hardpixel.eu/panel.js
+index 1710f23..295d37e 100644
+--- a/unite@hardpixel.eu/panel.js
++++ b/unite@hardpixel.eu/panel.js
+@@ -334,7 +334,19 @@ class WindowButtons extends Handlers.Feature {
+ 
+     if (this.isDark != dark) {
+       this.isDark = dark
+-      this._onThemeChange()
++      // macstyle: not inside this signal. It is emitted while St computes styles, and unloading
++      // a stylesheet there lets St resolve a url() of the dropped sheet, which aborts the shell
++      // (st-theme.c: assertion failed: base_file). Seen with Blur my Shell 78 on GNOME 50 and 51,
++      // which restyles the panel when a window is maximized.
++      if (!this._themeChangeLater) {
++        this._themeChangeLater = global.compositor.get_laters().add(
++          Meta.LaterType.BEFORE_REDRAW, () => {
++            this._themeChangeLater = 0
++            this._onThemeChange()
++            return false
++          }
++        )
++      }
+     }
+   }
+ 
+@@ -375,6 +387,11 @@ class WindowButtons extends Handlers.Feature {
+   }
+ 
+   destroy() {
++    if (this._themeChangeLater) {
++      global.compositor.get_laters().remove(this._themeChangeLater)
++      this._themeChangeLater = 0
++    }
++
+     this.signals.disconnectAll()
+     this.settings.disconnectAll()
+     this.styles.removeAll()

@@ -334,7 +334,19 @@ class WindowButtons extends Handlers.Feature {
 
     if (this.isDark != dark) {
       this.isDark = dark
-      this._onThemeChange()
+      // macstyle: not inside this signal. It is emitted while St computes styles, and unloading
+      // a stylesheet there lets St resolve a url() of the dropped sheet, which aborts the shell
+      // (st-theme.c: assertion failed: base_file). Seen with Blur my Shell 78 on GNOME 50 and 51,
+      // which restyles the panel when a window is maximized.
+      if (!this._themeChangeLater) {
+        this._themeChangeLater = global.compositor.get_laters().add(
+          Meta.LaterType.BEFORE_REDRAW, () => {
+            this._themeChangeLater = 0
+            this._onThemeChange()
+            return false
+          }
+        )
+      }
     }
   }
 
@@ -375,6 +387,11 @@ class WindowButtons extends Handlers.Feature {
   }
 
   destroy() {
+    if (this._themeChangeLater) {
+      global.compositor.get_laters().remove(this._themeChangeLater)
+      this._themeChangeLater = 0
+    }
+
     this.signals.disconnectAll()
     this.settings.disconnectAll()
     this.styles.removeAll()

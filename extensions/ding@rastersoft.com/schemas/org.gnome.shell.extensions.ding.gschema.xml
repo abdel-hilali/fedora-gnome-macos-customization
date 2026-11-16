@@ -85,11 +85,6 @@
         <summary>Type of Files to not Stack</summary>
         <description>An Array of strings types, Don't Stack these types of files</description>
     </key>
-    <key type="b" name="use-nemo">
-        <default>false</default>
-        <summary>Use Nemo to open folders</summary>
-        <description>Use Nemo instead of Nautilus to open folders.</description>
-    </key>
     <key type="b" name="show-link-emblem">
         <default>true</default>
         <summary>Add an emblem to links</summary>

@@ -25,6 +25,10 @@
     border-color: rgba(0, 0, 0, 0);
 }
 
+.nodropborder:drop(active) {
+    box-shadow: none;
+}
+
 .file-item-hover {
    background-color: rgba(238, 238, 238, 0.2);
 }

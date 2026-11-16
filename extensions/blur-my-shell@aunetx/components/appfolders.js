@@ -1,23 +1,19 @@
-import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
+import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
+import St from 'gi://St';
+import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import { adjustAnimationTime } from 'resource:///org/gnome/shell/misc/animationUtils.js';
 
-import { PaintSignals } from '../conveniences/paint_signals.js';
-// TODO drop Tweener in favour of Clutter's `ease` (will need to extend the blur effect for it)
-const Tweener = imports.tweener.tweener;
+import { DynamicPipeline } from '../render/dynamic_surface.js';
+import {
+    get_component_style,
+    get_pipeline_id,
+    connect_system_style_changes,
+} from '../conveniences/style.js';
 
-// TODO: Drop GNOME 46 backwards compatibility
-const transparent = Clutter.Color ?
-    Clutter.Color.from_pixel(0x00000000) :
-    new Cogl.Color({
-        red: 0,
-        green: 0,
-        blue: 0,
-        alpha: 0
-    });
 const FOLDER_DIALOG_ANIMATION_TIME = 200;
+const FOLDER_DIALOG_SHADE_FACTOR = 0.25;
 
 const DIALOGS_STYLES = [
     "appfolder-dialogs-transparent",
@@ -25,235 +21,355 @@ const DIALOGS_STYLES = [
     "appfolder-dialogs-dark"
 ];
 
-let original_zoomAndFadeIn = null;
-let original_zoomAndFadeOut = null;
-let sigma;
-let brightness;
-
-let _zoomAndFadeIn = function () {
-    let [sourceX, sourceY] =
-        this._source.get_transformed_position();
-    let [dialogX, dialogY] =
-        this.child.get_transformed_position();
-
-    this.child.set({
-        translation_x: sourceX - dialogX,
-        translation_y: sourceY - dialogY,
-        scale_x: this._source.width / this.child.width,
-        scale_y: this._source.height / this.child.height,
-        opacity: 0,
-    });
-
-    this.set_background_color(transparent);
-
-    let blur_effect = this.get_effect("appfolder-blur");
-
-    blur_effect.radius = 0;
-    blur_effect.brightness = 1.0;
-    Tweener.addTween(blur_effect,
-        {
-            radius: sigma * 2,
-            brightness: brightness,
-            time: adjustAnimationTime(FOLDER_DIALOG_ANIMATION_TIME / 1000),
-            transition: 'easeOutQuad'
-        }
-    );
-
-    this.child.ease({
-        translation_x: 0,
-        translation_y: 0,
-        scale_x: 1,
-        scale_y: 1,
-        opacity: 255,
-        duration: FOLDER_DIALOG_ANIMATION_TIME,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-    });
-
-    this._needsZoomAndFade = false;
-
-    if (this._sourceMappedId === 0) {
-        this._sourceMappedId = this._source.connect(
-            'notify::mapped', this._zoomAndFadeOut.bind(this));
+const AppFolderSurface = GObject.registerClass({
+    GTypeName: 'BmsAppFolderSurface',
+}, class AppFolderSurface extends St.Widget {
+    vfunc_allocate(box) {
+        super.vfunc_allocate(box);
+        if (this.blurActor && this.viewBox)
+            this.blurActor.allocate(this.viewBox.get_allocation_box());
     }
+});
+
+function blur_pipelines(dialog) {
+    return [dialog._bms_appfolder_pipeline, dialog._bms_appfolder_backdrop_pipeline]
+        .filter(Boolean);
+}
+
+function set_blur_opacity(dialog, factor) {
+    blur_pipelines(dialog).forEach(pipeline => pipeline.set_opacity_factor(factor));
+}
+
+function stop_blur_animation(dialog) {
+    dialog._bms_appfolder_blur_timeline?.stop();
+    dialog._bms_appfolder_blur_timeline = null;
+}
+
+function animate_blur(dialog, target, mode) {
+    stop_blur_animation(dialog);
+    const pipeline = dialog._bms_appfolder_pipeline;
+    const start = pipeline.opacityFactor;
+    const settings = St.Settings.get();
+    const duration = settings.enable_animations
+        ? FOLDER_DIALOG_ANIMATION_TIME * settings.slow_down_factor
+        : 0;
+    if (duration === 0 || start === target) {
+        set_blur_opacity(dialog, target);
+        return;
+    }
+    const timeline = new Clutter.Timeline({
+        actor: pipeline.contentActor,
+        duration,
+    });
+    timeline.set_progress_mode(mode);
+    timeline.connect('new-frame', () => {
+        const progress = timeline.get_progress();
+        set_blur_opacity(dialog, start + (target - start) * progress);
+    });
+    timeline.connect('completed', () => {
+        set_blur_opacity(dialog, target);
+        dialog._bms_appfolder_blur_timeline = null;
+    });
+    dialog._bms_appfolder_blur_timeline = timeline;
+    timeline.start();
+}
+
+function update_corner_radius(dialog) {
+    const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+    const radius = dialog._viewBox.get_theme_node().get_border_radius(St.Corner.TOPLEFT);
+    dialog._bms_appfolder_pipeline?.set_corner_radius(radius / scale);
+}
+
+function reduce_background_shade(dialog) {
+    const transition = dialog.get_transition('background-color');
+    const color = (transition
+        ? transition.get_interval().peek_final_value()
+        : dialog.get_background_color()).copy();
+    color.alpha = Math.round(color.alpha * FOLDER_DIALOG_SHADE_FACTOR);
+    if (transition)
+        transition.set_to(color);
+    else
+        dialog.set_background_color(color);
+}
+
+const setLighterBackground = function (...params) {
+    const result = this._bms_original_setLighterBackground.apply(this, params);
+    reduce_background_shade(this);
+    return result;
 };
 
-let _zoomAndFadeOut = function () {
-    if (!this._isOpen)
-        return;
+function create_surface(dialog) {
+    if (dialog._bms_appfolder_surface)
+        return dialog._bms_appfolder_surface;
 
-    if (!this._source.mapped) {
-        this.hide();
-        return;
-    }
+    const viewBox = dialog._viewBox;
+    const container = viewBox.get_parent();
+    // another extension may have restructured the dialog
+    if (container !== dialog.child)
+        return null;
 
-    let [sourceX, sourceY] =
-        this._source.get_transformed_position();
-    let [dialogX, dialogY] =
-        this.child.get_transformed_position();
-
-    this.set_background_color(transparent);
-
-    let blur_effect = this.get_effect("appfolder-blur");
-    Tweener.addTween(blur_effect,
-        {
-            radius: 0,
-            brightness: 1.0,
-            time: adjustAnimationTime(FOLDER_DIALOG_ANIMATION_TIME / 1000),
-            transition: 'easeInQuad'
-        }
-    );
-
-    this.child.ease({
-        translation_x: sourceX - dialogX,
-        translation_y: sourceY - dialogY,
-        scale_x: this._source.width / this.child.width,
-        scale_y: this._source.height / this.child.height,
-        opacity: 0,
-        duration: FOLDER_DIALOG_ANIMATION_TIME,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        onComplete: () => {
-            this.child.set({
-                translation_x: 0,
-                translation_y: 0,
-                scale_x: 1,
-                scale_y: 1,
-                opacity: 255,
-            });
-            this.hide();
-
-            this._popdownCallbacks.forEach(func => func());
-            this._popdownCallbacks = [];
-        },
+    const surface = new AppFolderSurface({
+        layout_manager: new Clutter.BinLayout(),
+        style_class: container.style_class,
+        style: container.style,
+        x_align: container.x_align,
+        y_align: container.y_align,
+        x_expand: container.x_expand,
+        y_expand: container.y_expand,
     });
+    surface.viewBox = viewBox;
+    container.remove_child(viewBox);
+    surface.add_child(viewBox);
+    dialog.set_child(surface);
+    dialog._bms_appfolder_original_container = container;
+    dialog._bms_appfolder_surface = surface;
+    return surface;
+}
 
-    this._needsZoomAndFade = false;
+/// The grid behind an open folder is blurred by a sibling placed under the dialog, which zooms its
+/// child while opening. It covers the primary monitor like the dialog does, rather than following
+/// the dialog, which can be laid out after it.
+function add_backdrop(dialog, effects_manager, pipeline_id) {
+    const pipeline = new DynamicPipeline(
+        effects_manager,
+        global.blur_my_shell._pipelines_manager,
+        pipeline_id
+    );
+    const actor = pipeline.create_actor('bms-appfolder-backdrop');
+    pipeline.ownsActor = true;
+    actor.add_constraint(new Layout.MonitorConstraint({ primary: true }));
+    dialog.bind_property('visible', actor, 'visible', GObject.BindingFlags.SYNC_CREATE);
+    dialog.get_parent().insert_child_below(actor, dialog);
+    pipeline.attach_pipeline();
+    pipeline.set_opacity_factor(dialog._bms_appfolder_pipeline.opacityFactor);
+    dialog._bms_appfolder_backdrop_pipeline = pipeline;
+}
+
+function remove_backdrop(dialog) {
+    dialog._bms_appfolder_backdrop_pipeline?.destroy();
+    dialog._bms_appfolder_backdrop_pipeline = null;
+}
+
+function destroy_surface(dialog) {
+    const surface = dialog._bms_appfolder_surface;
+    if (!surface)
+        return;
+
+    const container = dialog._bms_appfolder_original_container;
+    if (dialog.child === surface && dialog._viewBox.get_parent() === surface) {
+        surface.remove_child(dialog._viewBox);
+        container.set_child(dialog._viewBox);
+        dialog.set_child(container);
+    }
+    surface.destroy();
+    dialog._bms_appfolder_surface = null;
+    dialog._bms_appfolder_original_container = null;
+}
+
+const zoomAndFadeIn = function (...params) {
+    blur_pipelines(this).forEach(pipeline => pipeline.attach_pipeline());
+    if (!this._bms_appfolder_blur_timeline)
+        set_blur_opacity(this, 0);
+    animate_blur(this, 1, Clutter.AnimationMode.EASE_OUT_QUAD);
+
+    const result = this._bms_original_zoomAndFadeIn.apply(this, params);
+    reduce_background_shade(this);
+    if (
+        this._bms_original_sourceMappedId === 0
+        && !this._bms_created_sourceMappedId
+        && this._sourceMappedId
+    )
+        this._bms_created_sourceMappedId = this._sourceMappedId;
+    return result;
+};
+
+const zoomAndFadeOut = function (...params) {
+    if (this._isOpen && this._source.mapped)
+        animate_blur(this, 0, Clutter.AnimationMode.EASE_IN_QUAD);
+
+    return this._bms_original_zoomAndFadeOut.apply(this, params);
 };
 
 
 export const AppFoldersBlur = class AppFoldersBlur {
-    // we do not use the effects manager and dummy pipelines here because we
-    // really want to manage our sigma value ourself during the transition
-    constructor(connections, settings, _) {
+    constructor(connections, settings, effects_manager) {
         this.connections = connections;
-        this.paint_signals = new PaintSignals(connections);
         this.settings = settings;
+        this.effects_manager = effects_manager;
+        this.dialogs = new Set();
+        this.blur_idle_id = 0;
+        this.enabled = false;
     }
 
     enable() {
+        if (this.enabled)
+            return;
+
         this._log("blurring appfolders");
+        this.enabled = true;
 
-        brightness = this.settings.appfolder.BRIGHTNESS;
-        sigma = this.settings.appfolder.SIGMA;
-
-        let appDisplay = Main.overview._overview.controls._appDisplay;
-
-        if (appDisplay._folderIcons.length > 0) {
-            this.blur_appfolders();
-        }
+        const appDisplay = this.get_app_display();
+        if (appDisplay._folderIcons.length > 0)
+            this.queue_blur_appfolders();
 
         this.connections.connect(
-            appDisplay, 'view-loaded', _ => this.blur_appfolders()
+            appDisplay, 'view-loaded', _ => this.queue_blur_appfolders()
         );
+
+        connect_system_style_changes(this.connections, () => {
+            if (this.settings.appfolder.PIPELINE_AUTO_MODE)
+                this.update_pipeline();
+            this.blur_appfolders();
+        });
+    }
+
+    queue_blur_appfolders() {
+        if (this.blur_idle_id)
+            return;
+
+        this.blur_idle_id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this.blur_idle_id = 0;
+            this.blur_appfolders();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    get_app_display() {
+        return Main.overview._overview.controls._appDisplay;
     }
 
     blur_appfolders() {
-        let appDisplay = Main.overview._overview.controls._appDisplay;
+        const style = DIALOGS_STYLES[this.get_folder_style() - 1];
 
-        if (this.settings.HACKS_LEVEL === 1)
-            this._log("appfolders hack level 1");
-
-        appDisplay._folderIcons.forEach(icon => {
+        for (const icon of this.get_app_display()._folderIcons) {
             icon._ensureFolderDialog();
+            const dialog = icon._dialog;
 
-            if (original_zoomAndFadeIn == null) {
-                original_zoomAndFadeIn = icon._dialog._zoomAndFadeIn;
+            if (!this.dialogs.has(dialog)) {
+                dialog._bms_original_zoomAndFadeIn = dialog._zoomAndFadeIn;
+                dialog._bms_original_zoomAndFadeOut = dialog._zoomAndFadeOut;
+                dialog._bms_original_setLighterBackground = dialog._setLighterBackground;
+                dialog._bms_original_sourceMappedId = dialog._sourceMappedId;
+                this.dialogs.add(dialog);
+                this.connections.connect(dialog, 'destroy', () => {
+                    stop_blur_animation(dialog);
+                    dialog._bms_appfolder_pipeline?.destroy();
+                    remove_backdrop(dialog);
+                    dialog._bms_appfolder_original_container?.destroy();
+                    this.dialogs.delete(dialog);
+                });
+                this.connections.connect(dialog._viewBox, 'style-changed',
+                    () => update_corner_radius(dialog));
+                this.connections.connect(dialog, 'notify::mapped', () => {
+                    if (!dialog.mapped) {
+                        stop_blur_animation(dialog);
+                        set_blur_opacity(dialog, 0);
+                    }
+                });
             }
-            if (original_zoomAndFadeOut == null) {
-                original_zoomAndFadeOut = icon._dialog._zoomAndFadeOut;
+
+            if (!dialog._bms_appfolder_pipeline) {
+                const surface = create_surface(dialog);
+                if (!surface)
+                    continue;
+
+                const pipeline = new DynamicPipeline(
+                    this.effects_manager,
+                    global.blur_my_shell._pipelines_manager,
+                    get_pipeline_id(this.settings.appfolder),
+                    { corner_radius: 0 }
+                );
+                const actor = pipeline.create_actor('bms-appfolder-blurred-widget');
+                pipeline.ownsActor = true;
+                surface.blurActor = actor;
+                surface.insert_child_below(actor, dialog._viewBox);
+                pipeline.attach_pipeline();
+                dialog._bms_appfolder_pipeline = pipeline;
+                update_corner_radius(dialog);
             }
 
-            let blur_effect = new Shell.BlurEffect({
-                name: "appfolder-blur",
-                radius: sigma * 2,
-                brightness: brightness,
-                mode: Shell.BlurMode.BACKGROUND
-            });
-
-            icon._dialog.remove_effect_by_name("appfolder-blur");
-            icon._dialog.add_effect(blur_effect);
+            if (!this.settings.appfolder.BLUR_BEHIND_FOLDERS)
+                remove_backdrop(dialog);
+            else if (!dialog._bms_appfolder_backdrop_pipeline)
+                add_backdrop(dialog, this.effects_manager, get_pipeline_id(this.settings.appfolder));
 
             DIALOGS_STYLES.forEach(
-                style => icon._dialog._viewBox.remove_style_class_name(style)
+                style => dialog._viewBox.remove_style_class_name(style)
             );
+            if (style)
+                dialog._viewBox.add_style_class_name(style);
 
-            if (this.settings.appfolder.STYLE_DIALOGS > 0)
-                icon._dialog._viewBox.add_style_class_name(
-                    DIALOGS_STYLES[this.settings.appfolder.STYLE_DIALOGS - 1]
-                );
-
-            // finally override the builtin functions
-            icon._dialog._zoomAndFadeIn = _zoomAndFadeIn;
-            icon._dialog._zoomAndFadeOut = _zoomAndFadeOut;
-
-
-            // HACK
-            //
-            //`Shell.BlurEffect` does not repaint when shadows are under it. [1]
-            //
-            // This does not entirely fix this bug (shadows caused by windows
-            // still cause artifacts), but it prevents the shadows of the panel
-            // buttons to cause artifacts on the panel itself
-            //
-            // [1]: https://gitlab.gnome.org/GNOME/gnome-shell/-/issues/2857
-
-            if (this.settings.HACKS_LEVEL === 1) {
-                this.paint_signals.disconnect_all_for_actor(icon._dialog);
-                this.paint_signals.connect(icon._dialog, blur_effect);
-            } else {
-                this.paint_signals.disconnect_all();
+            dialog._zoomAndFadeIn = zoomAndFadeIn;
+            dialog._zoomAndFadeOut = zoomAndFadeOut;
+            if (dialog._setLighterBackground !== setLighterBackground) {
+                dialog._setLighterBackground = setLighterBackground;
+                if (dialog._isOpen)
+                    dialog._setLighterBackground(false);
             }
-        });
-    };
-
-    set_sigma(s) {
-        sigma = s;
-        if (this.settings.appfolder.BLUR)
-            this.blur_appfolders();
+        }
     }
 
-    set_brightness(b) {
-        brightness = b;
-        if (this.settings.appfolder.BLUR)
-            this.blur_appfolders();
+    get_folder_style() {
+        const style = this.settings.appfolder.STYLE_DIALOGS;
+        if (style >= 0 && style <= 3)
+            return style;
+
+        const FOLDER_STYLE = get_component_style(
+            this.settings.appfolder.STYLE_DIALOGS,
+            DIALOGS_STYLES
+        );
+
+        return FOLDER_STYLE + 1;
+    }
+
+    update_pipeline() {
+        this.dialogs.forEach(dialog => {
+            blur_pipelines(dialog).forEach(pipeline =>
+                pipeline.change_pipeline_to(get_pipeline_id(this.settings.appfolder)));
+        });
     }
 
     disable() {
         this._log("removing blur from appfolders");
+        this.enabled = false;
 
-        let appDisplay = Main.overview._overview.controls._appDisplay;
-
-        if (original_zoomAndFadeIn != null) {
-            appDisplay._folderIcons.forEach(icon => {
-                if (icon._dialog)
-                    icon._dialog._zoomAndFadeIn = original_zoomAndFadeIn;
-            });
+        if (this.blur_idle_id) {
+            GLib.Source.remove(this.blur_idle_id);
+            this.blur_idle_id = 0;
         }
 
-        if (original_zoomAndFadeOut != null) {
-            appDisplay._folderIcons.forEach(icon => {
-                if (icon._dialog)
-                    icon._dialog._zoomAndFadeOut = original_zoomAndFadeOut;
-            });
-        }
-
-        appDisplay._folderIcons.forEach(icon => {
-            if (icon._dialog) {
-                icon._dialog.remove_effect_by_name("appfolder-blur");
-                DIALOGS_STYLES.forEach(
-                    s => icon._dialog._viewBox.remove_style_class_name(s)
-                );
+        this.dialogs.forEach(dialog => {
+            stop_blur_animation(dialog);
+            if (
+                dialog._bms_created_sourceMappedId
+                && dialog._sourceMappedId === dialog._bms_created_sourceMappedId
+            ) {
+                dialog._source.disconnect(dialog._sourceMappedId);
+                dialog._sourceMappedId = 0;
             }
+            if (dialog._zoomAndFadeIn === zoomAndFadeIn)
+                dialog._zoomAndFadeIn = dialog._bms_original_zoomAndFadeIn;
+            if (dialog._zoomAndFadeOut === zoomAndFadeOut)
+                dialog._zoomAndFadeOut = dialog._bms_original_zoomAndFadeOut;
+            if (dialog._setLighterBackground === setLighterBackground) {
+                dialog._setLighterBackground = dialog._bms_original_setLighterBackground;
+                if (dialog._isOpen)
+                    dialog._setLighterBackground(false);
+            }
+            dialog._bms_appfolder_pipeline?.destroy();
+            dialog._bms_appfolder_pipeline = null;
+            remove_backdrop(dialog);
+            destroy_surface(dialog);
+            DIALOGS_STYLES.forEach(
+                style => dialog._viewBox.remove_style_class_name(style)
+            );
+            delete dialog._bms_original_zoomAndFadeIn;
+            delete dialog._bms_original_zoomAndFadeOut;
+            delete dialog._bms_original_setLighterBackground;
+            delete dialog._bms_original_sourceMappedId;
+            delete dialog._bms_created_sourceMappedId;
         });
+        this.dialogs.clear();
 
         this.connections.disconnect_all();
     }

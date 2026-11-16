@@ -111,7 +111,6 @@ export var DesktopManager = class {
         this._fileItemMenu = new FileItemMenu.FileItemMenu(this, mainApp);
         this._showHidden = Prefs.gtkSettings.get_boolean('show-hidden');
         this.showDropPlace = Prefs.desktopSettings.get_boolean('show-drop-place');
-        this.useNemo = Prefs.desktopSettings.get_boolean('use-nemo');
         this.showLinkEmblem = Prefs.desktopSettings.get_boolean('show-link-emblem');
         this.darkText = Prefs.desktopSettings.get_boolean('dark-text-in-labels');
         this._settingsId = Prefs.desktopSettings.connect('changed', (obj, key) => {
@@ -127,10 +126,6 @@ export var DesktopManager = class {
                 this._updateDesktop().catch(e => {
                     print(`Exception while updating Desktop after Show Emblems changed: ${e.message}\n${e.stack}`);
                 });
-                return;
-            }
-            if (key === 'use-nemo') {
-                this.useNemo = Prefs.desktopSettings.get_boolean('use-nemo');
                 return;
             }
             if (key === 'icon-size') {

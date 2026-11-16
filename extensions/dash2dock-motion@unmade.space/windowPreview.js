@@ -111,7 +111,10 @@ class WindowPreviewList extends PopupMenu.PopupMenuSection {
 
         const position = Utils.getPosition();
         this.isHorizontal = position === St.Side.BOTTOM || position === St.Side.TOP;
-        this.box.set_vertical(!this.isHorizontal);
+        // Remove this when can use GNOME 48
+        this.box.set_vertical?.(!this.isHorizontal);
+        this.box.set_orientation?.(this.isHorizontal
+            ? Clutter.Orientation.HORIZONTAL : Clutter.Orientation.VERTICAL);
         this.box.set_name('dashtodockWindowList');
         Utils.addActor(this.actor, this.box);
         this.actor._delegate = this;
@@ -276,10 +279,6 @@ class WindowPreviewList extends PopupMenu.PopupMenuSection {
         for (let i = 0; i < addedItems.length; i++)
             addedItems[i].item.show(animate);
 
-        // Workaround for https://bugzilla.gnome.org/show_bug.cgi?id=692744
-        // Without it, StBoxLayout may use a stale size cache
-        this.box.queue_relayout();
-
         if (newWin.length < 1)
             this._getTopMenu().close(~0);
 
@@ -386,10 +385,14 @@ class WindowPreviewMenuItem extends PopupMenu.PopupBaseMenuItem {
         });
 
         const box = new St.BoxLayout({
-            vertical: true,
             reactive: true,
             x_expand: true,
         });
+
+        if (box.orientation !== undefined)
+            box.orientation = Clutter.Orientation.VERTICAL;
+        else
+            box.vertical = true;
 
         if (box.add) {
             box.add(overlayGroup);

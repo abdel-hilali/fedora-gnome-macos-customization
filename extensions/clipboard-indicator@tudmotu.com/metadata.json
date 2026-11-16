@@ -5,13 +5,13 @@
   "name": "Clipboard Indicator",
   "settings-schema": "org.gnome.shell.extensions.clipboard-indicator",
   "shell-version": [
-    "46",
     "47",
     "48",
     "49",
-    "50"
+    "50",
+    "51"
   ],
   "url": "https://github.com/Tudmotu/gnome-shell-extension-clipboard-indicator",
   "uuid": "clipboard-indicator@tudmotu.com",
-  "version": 71
+  "version": 74
 }

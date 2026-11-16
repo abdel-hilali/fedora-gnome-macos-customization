@@ -8,6 +8,9 @@ const FileCopyFlags = Gio.FileCopyFlags;
 const FileTest = GLib.FileTest;
 
 export class Registry {
+    #writing = false;
+    #pendingWrite = null;
+
     constructor ({ settings, uuid }) {
         this.uuid = uuid;
         this.settings = settings;
@@ -44,25 +47,39 @@ export class Registry {
     }
 
     writeToFile (registry) {
-        let json = JSON.stringify(registry);
-        let contents = new GLib.Bytes(json);
+        // Only one write may be in flight. When GIO can't use a temp file
+        // (e.g. hardlinked file, or ownership can't be preserved) it rewrites
+        // the file in place, and two overlapping writes then leave the tail
+        // of the longer one behind the shorter one, corrupting the JSON.
+        // Queued writes are coalesced: only the newest content matters.
+        this.#pendingWrite = JSON.stringify(registry);
+        if (!this.#writing) this.#flushWrite();
+    }
+
+    #flushWrite () {
+        const contents = new GLib.Bytes(this.#pendingWrite);
+        this.#pendingWrite = null;
+        this.#writing = true;
 
         // Make sure dir exists
         GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
 
-        // Write contents to file asynchronously
+        // replace_contents writes all bytes (a single write_bytes call may not).
+        // REPLACE_DESTINATION makes GIO always write a temp file and rename it
+        // over the registry, instead of falling back to rewriting it in place
+        // (hardlinks, symlinks, ownership that can't be copied). Owner and
+        // mode of the old file are not kept, which is fine for a cache file.
         let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                            GLib.PRIORITY_DEFAULT, null, (obj, res) => {
+        file.replace_contents_bytes_async(contents, null, false,
+                            Gio.FileCreateFlags.REPLACE_DESTINATION, null, (obj, res) => {
+            try {
+                obj.replace_contents_finish(res);
+            } catch (e) {
+                console.error('Clipboard Indicator: failed to write registry file', e);
+            }
 
-            let stream = obj.replace_finish(res);
-
-            stream.write_bytes_async(contents, GLib.PRIORITY_DEFAULT,
-                                null, (w_obj, w_res) => {
-
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
+            this.#writing = false;
+            if (this.#pendingWrite !== null) this.#flushWrite();
         });
     }
 
@@ -75,28 +92,43 @@ export class Registry {
                 file.query_info_async('*', FileQueryInfoFlags.NONE,
                                       GLib.PRIORITY_DEFAULT, null, (src, res) => {
                     // Check if file size is larger than CACHE_FILE_SIZE
-                    // If so, make a backup of file, and resolve with empty array
+                    // If so, make a backup of file, and keep only its favorites
                     let file_info = src.query_info_finish(res);
+                    let isOversized = file_info.get_size() >= CACHE_FILE_SIZE * 1024 * 1024;
+                    let source = file;
 
-                    if (file_info.get_size() >= CACHE_FILE_SIZE * 1024 * 1024) {
-                        let destination = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH);
-
-                        file.move(destination, FileCopyFlags.OVERWRITE, null, null);
-                        resolve([]);
-                        return;
+                    if (isOversized) {
+                        source = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH);
+                        file.move(source, FileCopyFlags.OVERWRITE, null, null);
                     }
 
-                    file.load_contents_async(null, (obj, res) => {
+                    source.load_contents_async(null, (obj, res) => {
                         let [success, contents] = obj.load_contents_finish(res);
 
                         if (success) {
                             let max_size = this.settings.get_int(PrefsFields.HISTORY_SIZE);
                             const cacheTextData = new TextDecoder().decode(contents);
-                            let registry;
-                            if (cacheTextData.trim().length == 0) {
-                                registry = [];
-                            } else {
-                                registry = JSON.parse(cacheTextData);
+                            let registry = [];
+                            if (cacheTextData.trim().length > 0) {
+                                try {
+                                    const parsed = JSON.parse(cacheTextData);
+                                    if (!Array.isArray(parsed))
+                                        throw new Error('not a list of entries');
+                                    registry = parsed;
+                                } catch (e) {
+                                    // Start with an empty history instead of never
+                                    // loading. Keep the unreadable file as the backup,
+                                    // so the next write does not overwrite it
+                                    console.error(`Clipboard Indicator: could not read registry file, starting with an empty history: ${e.message}`);
+                                    if (!isOversized) {
+                                        try {
+                                            file.move(Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH),
+                                                      FileCopyFlags.OVERWRITE, null, null);
+                                        } catch (moveError) {
+                                            console.error(moveError);
+                                        }
+                                    }
+                                }
                             }
                             const entriesPromises = registry.map(
                                 jsonEntry => {
@@ -108,17 +140,31 @@ export class Registry {
                                 clipboardEntries = clipboardEntries
                                     .filter(entry => entry !== null);
 
-                                let registryNoFavorite = clipboardEntries
-                                    .filter(entry => !entry.isFavorite());
+                                if (isOversized) {
+                                    const favorites = clipboardEntries
+                                        .filter(entry => entry.isFavorite());
 
-                                while (registryNoFavorite.length > max_size) {
-                                    let oldestNoFavorite = registryNoFavorite.shift();
-                                    let itemIdx = clipboardEntries.indexOf(oldestNoFavorite);
-                                    clipboardEntries.splice(itemIdx,1);
+                                    // Nothing else rewrites the registry until the
+                                    // next clipboard change, so persist favorites now
+                                    resolve(favorites);
+                                    this.write(favorites);
 
-                                    registryNoFavorite = clipboardEntries.filter(
-                                        entry => !entry.isFavorite()
-                                    );
+                                    return;
+                                }
+
+                                // Drop the oldest unpinned entries beyond the
+                                // history size, in a single pass
+                                let excess = clipboardEntries
+                                    .filter(entry => !entry.isFavorite()).length - max_size;
+
+                                if (excess > 0) {
+                                    clipboardEntries = clipboardEntries.filter(entry => {
+                                        if (excess > 0 && !entry.isFavorite()) {
+                                            excess--;
+                                            return false;
+                                        }
+                                        return true;
+                                    });
                                 }
 
                                 resolve(clipboardEntries);
@@ -136,6 +182,38 @@ export class Registry {
                 resolve([]);
             }
         });
+    }
+
+    // Entries of a history archive extracted into directory. An image is
+    // read only from a regular file in directory, never through a link
+    async readImport (directory) {
+        const contents = await new Promise((resolve, reject) => {
+            Gio.file_new_for_path(`${directory}/registry.txt`).load_contents_async(null, (file, res) => {
+                try {
+                    resolve(file.load_contents_finish(res)[1]);
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+        const registry = JSON.parse(new TextDecoder().decode(contents));
+        if (!Array.isArray(registry)) throw new Error('not a list of entries');
+
+        const jsonEntries = registry.filter(jsonEntry => {
+            if (typeof jsonEntry?.contents !== 'string') return false;
+            if (ClipboardEntry.__isText(jsonEntry.mimetype || 'text/plain')) return true;
+
+            jsonEntry.contents = `${directory}/${GLib.path_get_basename(jsonEntry.contents)}`;
+            try {
+                return Gio.file_new_for_path(jsonEntry.contents)
+                    .query_info('standard::type', FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+                    .get_file_type() === Gio.FileType.REGULAR;
+            } catch (e) {
+                return false;
+            }
+        });
+        const entries = await Promise.all(jsonEntries.map(jsonEntry => ClipboardEntry.fromJSON(jsonEntry)));
+        return entries.filter(entry => entry !== null);
     }
 
     #entryFileExists (entry) {
@@ -168,7 +246,7 @@ export class Registry {
     }
 
     getEntryFilename (entry) {
-        return `${this.REGISTRY_DIR}/${entry.asBytes().hash()}`;
+        return `${this.REGISTRY_DIR}/${entry.hash()}`;
     }
 
     async writeEntryFile (entry) {
@@ -227,6 +305,8 @@ export class ClipboardEntry {
     #mimetype;
     #bytes;
     #favorite;
+    #cachedHash = null;
+    #cachedString = null;
 
     static #decode (contents) {
         return Uint8Array.from(contents.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
@@ -303,9 +383,9 @@ export class ClipboardEntry {
 
     getStringValue () {
         if (this.isImage()) {
-            return `[Image ${this.asBytes().hash()}]`;
+            return `[Image ${this.hash()}]`;
         }
-        return new TextDecoder().decode(this.#bytes);
+        return (this.#cachedString ??= new TextDecoder().decode(this.#bytes));
     }
 
     mimetype () {
@@ -331,6 +411,8 @@ export class ClipboardEntry {
     setText (text) {
         if (!this.isText()) return;
         this.#bytes = new TextEncoder().encode(text);
+        this.#cachedHash = null;
+        this.#cachedString = null;
     }
 
     #tag = null;
@@ -350,5 +432,9 @@ export class ClipboardEntry {
     equals (otherEntry) {
         return this.getStringValue() === otherEntry.getStringValue();
         // this.asBytes().equal(otherEntry.asBytes());
+    }
+
+    hash () {
+        return (this.#cachedHash ??= GLib.Bytes.new(this.#bytes).hash());
     }
 }

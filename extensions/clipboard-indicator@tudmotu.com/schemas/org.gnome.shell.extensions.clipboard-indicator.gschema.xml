@@ -2,6 +2,14 @@
     <schema id="org.gnome.shell.extensions.clipboard-indicator"
         path="/org/gnome/shell/extensions/clipboard-indicator/">
 
+    <key name="import-history-from" type="s">
+        <default>''</default>
+        <summary>Directory of an extracted history archive for the extension to import</summary>
+        <description>
+            Set by the preferences window. The extension clears it once the import is done.
+        </description>
+    </key>
+
     <key name="paste-button" type="b">
         <default>true</default>
         <summary>Add button to paste an entry</summary>
@@ -106,7 +114,7 @@
         <default>5</default>
         <summary>The allowed size for the registry cache file in MB</summary>
         <description>
-            If the cache overflows this limit, the file will be overriden.
+            If the cache overflows this limit, it is backed up and only pinned entries are kept.
             High limit might cause slowness of shell startup.
         </description>
         <range min="1" max="1024"/>

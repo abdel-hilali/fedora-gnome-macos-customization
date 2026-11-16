@@ -1,27 +1,8 @@
---- a/dash2dock-motion@unmade.space/extension.js
-+++ b/dash2dock-motion@unmade.space/extension.js
-@@ -12,10 +12,18 @@
- 
- export default class ContentDockExtension extends Extension.Extension {
-     enable() {
-+        // Local patch (macstyle, 2026-10-12): port of Dash to Dock v106+ (PR #2655). Disable the
-+        // dock on shutdown so its idle handlers do not touch windows being disposed at logout.
-+        // See https://gitlab.gnome.org/GNOME/gnome-shell/-/merge_requests/4214
-+        this._shutdownID = global.connect('shutdown', () => this.disable());
-         dockManager = new DockManager(this);
-     }
- 
-     disable() {
-+        if (this._shutdownID) {
-+            global.disconnect(this._shutdownID);
-+            delete this._shutdownID;
-+        }
-         dockManager?.destroy();
-         dockManager = null;
-     }
+diff --git a/dash2dock-motion@unmade.space/docking.js b/dash2dock-motion@unmade.space/docking.js
+index 4d0cd0c..f7e0ade 100644
 --- a/dash2dock-motion@unmade.space/docking.js
 +++ b/dash2dock-motion@unmade.space/docking.js
-@@ -2592,6 +2592,10 @@
+@@ -2885,6 +2885,10 @@ export class DockManager {
          [this._methodInjections, this._vfuncInjections, this._propertyInjections].forEach(
              injections => injections.removeWithLabel(Labels.MAIN_DASH));
  
@@ -32,11 +13,13 @@
          this.overviewControls.layout_manager._dash = this._oldDash;
          this.overviewControls.dash = this._oldDash;
          this.searchController._showAppsButton = this._oldDash.showAppsButton;
+diff --git a/dash2dock-motion@unmade.space/stylesheet.css b/dash2dock-motion@unmade.space/stylesheet.css
+index 0acf717..1992c4a 100644
 --- a/dash2dock-motion@unmade.space/stylesheet.css
 +++ b/dash2dock-motion@unmade.space/stylesheet.css
-@@ -1530,3 +1530,15 @@
-     background-color: transparent;
-     box-shadow: none;
+@@ -1676,3 +1676,15 @@
+     background-color: transparent !important;
+     box-shadow: none !important;
  }
 +
 +/* macstyle patch (2026-10-12): light mode only. Blur my Shell puts light-dash

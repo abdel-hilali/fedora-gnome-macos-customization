@@ -100,7 +100,7 @@ class SearchDialog extends ModalDialog.ModalDialog {
         this.contentLayout.add_child(this._entry);
 
         this._resultsBox = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             style_class: 'appmenu-search-results',
         });
         this.contentLayout.add_child(this._resultsBox);
@@ -321,7 +321,7 @@ class SearchDialog extends ModalDialog.ModalDialog {
 
     _emptyState() {
         const box = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             style_class: 'appmenu-search-empty-state',
         });
         box.add_child(new St.Icon({
@@ -378,13 +378,12 @@ class SearchDialog extends ModalDialog.ModalDialog {
                 });
 
                 const box = new St.BoxLayout({
-                    vertical: false,
                     style_class: 'appmenu-search-result-content',
                 });
                 box.add_child(this._iconForItem(item));
 
                 const textBox = new St.BoxLayout({
-                    vertical: true,
+                    orientation: Clutter.Orientation.VERTICAL,
                     style_class: 'appmenu-search-result-text',
                 });
                 textBox.add_child(new St.Label({

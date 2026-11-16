@@ -705,8 +705,19 @@ class Caffeine extends QuickSettings.SystemIndicator {
 
         // Change user state on icon scroll event
         this._indicator.reactive = true;
-        this._indicator.connectObject('scroll-event',
-            (actor, event) => this._handleScrollEvent(event), this);
+        if (ShellVersion >= 51) {
+            const scrollController = new Clutter.ScrollController({
+                flags: Clutter.ScrollControllerFlags.DISCRETE |
+                    Clutter.ScrollControllerFlags.SCROLL_VERTICAL |
+                    Clutter.ScrollControllerFlags.PHYSICAL_DIRECTION
+            });
+            scrollController.connectObject(
+                'scroll', this._handleScrollController.bind(this), this);
+            this._indicator.add_action(scrollController);
+        } else {
+            this._indicator.connectObject('scroll-event',
+                (_actor, event) => this._handleScrollEvent(event), this);
+        }
 
         // Init position and index of indicator icon
         this.indicatorPosition = this._settings.get_int(INDICATOR_POSITION);
@@ -910,6 +921,14 @@ class Caffeine extends QuickSettings.SystemIndicator {
         this._caffeineToggle.subtitle = text;
     }
 
+    _handleScrollController(_controller, _sprite, _source, _dx, dy) {
+        if (dy < 0) {
+            this._handleScrollDirection(Clutter.ScrollDirection.UP);
+        } else if (dy > 0) {
+            this._handleScrollDirection(Clutter.ScrollDirection.DOWN);
+        }
+    }
+
     _handleScrollEvent(event) {
         // Undo natural scrolling inversions (available on GNOME 49+)
         let scrollDirection = event.get_scroll_direction();
@@ -926,6 +945,10 @@ class Caffeine extends QuickSettings.SystemIndicator {
             }
         }
 
+        this._handleScrollDirection(scrollDirection);
+    }
+
+    _handleScrollDirection(scrollDirection) {
         switch (scrollDirection) {
         case Clutter.ScrollDirection.UP:
             if (!this._state) {
@@ -1091,6 +1114,7 @@ export default class CaffeineExtension extends Extension {
     disable() {
         this._caffeineIndicator.destroy();
         this._caffeineIndicator = null;
+        this._settings = null;
 
         // Unregister shortcut
         Main.wm.removeKeybinding(TOGGLE_SHORTCUT);
@@ -1098,6 +1122,10 @@ export default class CaffeineExtension extends Extension {
 
     _openPreferences() {
         this.openPreferences();
-        QuickSettingsMenu.menu.close(PopupAnimation.FADE);
+        if (ShellVersion >= 51) {
+            QuickSettingsMenu.menu.close({ fadeOnly: true });
+        } else {
+            QuickSettingsMenu.menu.close(PopupAnimation.FADE);
+        }
     }
 }

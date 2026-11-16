@@ -17,6 +17,7 @@ import { Registry, ClipboardEntry } from './registry.js';
 import { DialogManager } from './confirmDialog.js';
 import { PrefsFields } from './constants.js';
 import { Keyboard } from './keyboard.js';
+import { boxLayoutOrientation } from './compat.js';
 
 const CLIPBOARD_TYPE = St.ClipboardType.CLIPBOARD;
 
@@ -87,6 +88,9 @@ const ClipboardIndicator = GObject.registerClass({
 }, class ClipboardIndicator extends PanelMenu.Button {
     #refreshInProgress = false;
     #_imagePreviewOverlay = null;
+    #moveFirstOnClose = [];
+    #moveFirstClosedId = 0;
+    #historyLoaded = false;
 
     destroy () {
         this._destroyed = true;
@@ -142,7 +146,7 @@ const ClipboardIndicator = GObject.registerClass({
         });
 
         this._buttonText = new St.Label({
-            text: _('Text will be here'),
+            text: _('...'),
             y_align: Clutter.ActorAlign.CENTER
         });
 
@@ -158,6 +162,7 @@ const ClipboardIndicator = GObject.registerClass({
         this.add_child(hbox);
         this._createHistoryLabel();
         this._loadSettings();
+        this._updateTopbarLayout();
 
         if (CLEAR_ON_BOOT) this.registry.clearCacheFolder();
 
@@ -169,7 +174,10 @@ const ClipboardIndicator = GObject.registerClass({
             this._updateTopbarLayout();
             this._setupListener();
             this._setupHistoryIntervalClearing();
-        });
+            this.#historyLoaded = true;
+            // An import that was requested while the extension was off
+            this.#importHistory();
+        }).catch(e => console.error('Clipboard Indicator: _buildMenu failed', e));
     }
 
     #updateIndicatorContent(entry) {
@@ -387,7 +395,7 @@ const ClipboardIndicator = GObject.registerClass({
         // Empty state section
         this.emptyStateSection = new St.BoxLayout({
             style_class: 'clipboard-indicator-empty-state',
-            vertical: true
+            ...boxLayoutOrientation(true)
         });
         this.emptyStateSection.add_child(new St.Icon({
             icon_name: INDICATOR_ICON,
@@ -605,7 +613,7 @@ const ClipboardIndicator = GObject.registerClass({
         }
     }
 
-    _addEntry (entry, autoSelect, autoSetClip) {
+    _addEntry (entry, autoSelect, autoSetClip, asOldest = false) {
         let menuItem = new PopupMenu.PopupMenuItem('');
 
         menuItem.menu = this.menu;
@@ -616,8 +624,8 @@ const ClipboardIndicator = GObject.registerClass({
         // CLICK fix for Paste on Select: clicking behaves like Enter
         menuItem.connect('activate', () => {
             if (PASTE_ON_SELECT) {
-                this.#pasteItem(menuItem);
                 this._onMenuItemSelectedAndMenuClose(menuItem, false);
+                this.#pasteItem(menuItem);
             } else {
                 this._onMenuItemSelectedAndMenuClose(menuItem, true);
             }
@@ -671,8 +679,8 @@ const ClipboardIndicator = GObject.registerClass({
                 case Clutter.KEY_KP_Enter:
                 case Clutter.KEY_Return:
                     if (PASTE_ON_SELECT) {
-                        this.#pasteItem(menuItem);
                         this._onMenuItemSelectedAndMenuClose(menuItem, false);
+                        this.#pasteItem(menuItem);
                     } else {
                         this._onMenuItemSelectedAndMenuClose(menuItem, true);
                     }
@@ -682,7 +690,8 @@ const ClipboardIndicator = GObject.registerClass({
         });
 
         this._setEntryLabel(menuItem);
-        this.clipItemsRadioGroup.push(menuItem);
+        if (asOldest) this.clipItemsRadioGroup.unshift(menuItem);
+        else this.clipItemsRadioGroup.push(menuItem);
 
         if (entry.getTag()) {
             menuItem.tagLabel = new St.Label({
@@ -817,11 +826,8 @@ const ClipboardIndicator = GObject.registerClass({
                 : this._removeEntry(menuItem, 'delete')
         );
 
-        if (entry.isFavorite()) {
-            this.favoritesSection.addMenuItem(menuItem, 0);
-        } else {
-            this.historySection.addMenuItem(menuItem, 0);
-        }
+        const section = entry.isFavorite() ? this.favoritesSection : this.historySection;
+        section.addMenuItem(menuItem, asOldest ? undefined : 0);
 
         if (autoSelect === true) {
             this._selectMenuItem(menuItem, autoSetClip);
@@ -865,11 +871,16 @@ const ClipboardIndicator = GObject.registerClass({
 
     _clearHistory (invokedAutomatically = false) {
         // Don't remove pinned items
-        this.historySection._getMenuItems().forEach(mItem => {
-            if (KEEP_SELECTED_ON_CLEAR === false || !mItem.currentlySelected) {
-                this._removeEntry(mItem, 'delete');
-            }
-        });
+        const toRemove = this.historySection._getMenuItems().filter(mItem =>
+            KEEP_SELECTED_ON_CLEAR === false || !mItem.currentlySelected);
+
+        // Remove everything first, then write the registry and update the
+        // menu once, instead of once per removed entry.
+        toRemove.forEach(mItem => this._removeEntry(mItem, 'delete', true));
+        if (toRemove.length > 0) {
+            this._updateCache();
+            this.#showElements();
+        }
 
         if (NOTIFY_ON_CLEAR) {
             const message = invokedAutomatically
@@ -889,7 +900,7 @@ const ClipboardIndicator = GObject.registerClass({
         }
     }
 
-    _removeEntry (menuItem, event) {
+    _removeEntry (menuItem, event, deferUpdates = false) {
         let itemIdx = this.clipItemsRadioGroup.indexOf(menuItem);
 
         if(event === 'delete' && menuItem.currentlySelected) {
@@ -903,27 +914,26 @@ const ClipboardIndicator = GObject.registerClass({
             this.registry.deleteEntryFile(menuItem.entry);
         }
 
+        // The caller updates the cache and the menu once when removing many
+        if (deferUpdates) return;
+
         this._updateCache();
         this.#showElements();
     }
 
     _removeOldestEntries () {
-        let clipItemsRadioGroupNoFavorite = this.clipItemsRadioGroup.filter(
+        const noFavorite = this.clipItemsRadioGroup.filter(
             item => item.entry.isFavorite() === false);
+        const excess = noFavorite.length - MAX_REGISTRY_LENGTH;
 
-        const origSize = clipItemsRadioGroupNoFavorite.length;
+        if (excess <= 0) return;
 
-        while (clipItemsRadioGroupNoFavorite.length > MAX_REGISTRY_LENGTH) {
-            let oldestNoFavorite = clipItemsRadioGroupNoFavorite.shift();
-            this._removeEntry(oldestNoFavorite);
-
-            clipItemsRadioGroupNoFavorite = this.clipItemsRadioGroup.filter(
-                item => item.entry.isFavorite() === false);
-        }
-
-        if (clipItemsRadioGroupNoFavorite.length < origSize) {
-            this._updateCache();
-        }
+        // Remove the oldest first, then write the registry and update the
+        // menu once, instead of once per removed entry
+        noFavorite.slice(0, excess)
+            .forEach(item => this._removeEntry(item, undefined, true));
+        this._updateCache();
+        this.#showElements();
     }
 
     _onMenuItemSelected (menuItem, autoSet) {
@@ -970,7 +980,7 @@ const ClipboardIndicator = GObject.registerClass({
 
         // Ensure MOVE_ITEM_FIRST also applies when PASTE_ON_SELECT fast-path skips _refreshIndicator()
         if (PASTE_ON_SELECT && MOVE_ITEM_FIRST && !menuItem.entry.isFavorite()) {
-            this._moveItemFirst(menuItem);
+            this.#moveItemFirstWhenClosed(menuItem);
         }
 
         menuItem.menu.close();
@@ -980,11 +990,47 @@ const ClipboardIndicator = GObject.registerClass({
         return this.registry.read();
     }
 
+    // The preferences window extracts a history archive and passes its directory.
+    // Its entries go below the current ones, as the oldest. An entry already in
+    // the history is kept as it is, but pinned if the imported one is pinned
+    async #importHistory () {
+        const { settings } = this.extension;
+        const directory = settings.get_string(PrefsFields.IMPORT_HISTORY_FROM);
+        if (!directory) return;
+
+        try {
+            const entries = await this.registry.readImport(directory);
+            if (this._destroyed) return;
+
+            const current = new Map(this.clipItemsRadioGroup.map(item => [item.entry.getStringValue(), item]));
+            const added = new Set();
+            for (const entry of entries.reverse()) {
+                const value = entry.getStringValue();
+                const item = current.get(value);
+                if (item) {
+                    if (entry.isFavorite() && !item.entry.isFavorite()) this._favoriteToggle(item);
+                }
+                else if (!added.has(value)) {
+                    added.add(value);
+                    this._addEntry(entry, false, false, true);
+                }
+            }
+            this._updateCache();
+            this._removeOldestEntries();
+        }
+        catch (e) {
+            console.error('Clipboard Indicator: could not import history', e);
+        }
+        finally {
+            settings.set_string(PrefsFields.IMPORT_HISTORY_FROM, '');
+        }
+    }
+
     #addToCache (entry) {
         const entries = this.clipItemsRadioGroup
             .map(menuItem => menuItem.entry)
-            .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite())
-            .concat([entry]);
+            .concat([entry])
+            .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite());
         this.registry.write(entries);
     }
 
@@ -1025,7 +1071,7 @@ const ClipboardIndicator = GObject.registerClass({
                         this._selectMenuItem(menuItem, false);
 
                         if (!menuItem.entry.isFavorite() && MOVE_ITEM_FIRST) {
-                            this._moveItemFirst(menuItem);
+                            this.#moveItemFirstWhenClosed(menuItem);
                         }
 
                         return;
@@ -1056,6 +1102,32 @@ const ClipboardIndicator = GObject.registerClass({
         this._removeEntry(item);
         this._addEntry(item.entry, item.currentlySelected, false);
         this._updateCache();
+    }
+
+    // Reordering the items while the menu is on screen, open or closing, can put
+    // another item under the pointer. That item then takes the key focus and
+    // swallows the keys of a paste, so wait until the menu has closed
+    #moveItemFirstWhenClosed (item) {
+        if (!this.menu.isOpen && !this.menu.actor.visible) {
+            this._moveItemFirst(item);
+            return;
+        }
+
+        // Replay the requests in order, so the result matches moving each right away
+        this.#moveFirstOnClose.push(item.entry);
+        if (this.#moveFirstClosedId) return;
+
+        this.#moveFirstClosedId = this.menu.connect('menu-closed', () => {
+            this.menu.disconnect(this.#moveFirstClosedId);
+            this.#moveFirstClosedId = 0;
+
+            const entries = this.#moveFirstOnClose;
+            this.#moveFirstOnClose = [];
+            for (const entry of entries) {
+                const pending = this.clipItemsRadioGroup.find(m => m.entry === entry);
+                if (pending && !pending.entry.isFavorite()) this._moveItemFirst(pending);
+            }
+        });
     }
 
     _findItem (text) {
@@ -1415,8 +1487,13 @@ const ClipboardIndicator = GObject.registerClass({
         SHOW_PREVIEW_BUTTON         = settings.get_boolean(PrefsFields.SHOW_PREVIEW_BUTTON);
     }
 
-    async _onSettingsChange () {
+    async _onSettingsChange (_settings, key) {
         try {
+            if (key === PrefsFields.IMPORT_HISTORY_FROM) {
+                if (this.#historyLoaded) await this.#importHistory();
+                return;
+            }
+
             // Load the settings into variables
             this._fetchSettings();
 
@@ -1845,7 +1922,12 @@ const ClipboardIndicator = GObject.registerClass({
             style_class: 'ci-edit-textbox',
             x_expand: true,
             y_expand: true,
-            vertical: true,
+            ...boxLayoutOrientation(true),
+        });
+
+        // Use the theme's text color, so the text shows in light mode too
+        textBox.connect('style-changed', () => {
+            clutterText.color = textBox.get_theme_node().get_foreground_color();
         });
 
         textBox.add_child(clutterText);

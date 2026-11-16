@@ -22,7 +22,7 @@ cd fedora-gnome-macos-customization
 - It takes about a minute. It downloads the MacTahoe icon theme (about 10 MB), a terminal font (about 7 MB) and Powerlevel10k, the prompt engine.
 - When it is done, **log out and log back in**. GNOME starts new extensions only at login.
 
-You need **Fedora 44 Workstation with GNOME 50**, the version macstyle is tested on. Run the script from a terminal inside your GNOME desktop. If `git` is missing: `sudo dnf install git`.
+You need **Fedora 44 Workstation (GNOME 50)** or **Fedora 45 Workstation (GNOME 51)**. The script picks the right extensions for your version. Run the script from a terminal inside your GNOME desktop. If `git` is missing: `sudo dnf install git`.
 
 To undo everything, run `./uninstall.sh` (see [Uninstall](#uninstall)).
 
@@ -114,7 +114,7 @@ It brings back the settings and files saved by the first install, removes what t
 
 ## Good to know
 
-- macstyle is tested on Fedora 44 with GNOME 50 only. On other versions the script stops with a message; `--force` tries anyway.
+- macstyle is tested on Fedora 44 (GNOME 50) and Fedora 45 (GNOME 51). On other versions the script stops with a message; `--force` tries anyway with the extensions of the closest version.
 - Extensions start only after you log out and back in. An app that is open during the install changes the next time you start it.
 - Some apps run in X11 mode (through XWayland) so that their menus can reach the top bar. With X11 apps open, logging out takes about 5 seconds longer. This is a GNOME bug.
 - AppMenu, Multi Monitors Bar, Rounded Window Corners Reborn and Dash2Dock Motion are copies with our own fixes. extensions.gnome.org does not update them. To get our updates, run `git pull` and then `./install.sh` again.

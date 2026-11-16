@@ -47,6 +47,10 @@ const EXTENSION_ICONS_DIR = (() => {
 
 import { _ } from './i18n.js';
 
+// GNOME 51 opens and closes menus with {animate}; GNOME 50 with a PopupAnimation value,
+// where false means none. A plain false on 51 would animate.
+const NO_ANIMATION = parseInt(Config.PACKAGE_VERSION) >= 51 ? {animate: false} : false;
+
 // Lazy-built for i18n — rebuilt on every request so translations apply
 function _getStaticMenus() {
     return [
@@ -186,7 +190,7 @@ const TopLevelMenuButton = GObject.registerClass(
             // A submenu goes with the one it is in.
             for (const other of [...open]) {
                 if (other._parent !== this._entries && other._parent?.isOpen === false)
-                    other.close(false);
+                    other.close(NO_ANIMATION);
             }
         };
     }
@@ -464,7 +468,7 @@ const TopLevelMenuButton = GObject.registerClass(
         try {
             for (const item of holder._getMenuItems()) {
                 if (item.menu && openLabels.includes(item.label?.text))
-                    item.menu.open(false);
+                    item.menu.open(NO_ANIMATION);
             }
         } finally {
             this._reopening = false;
@@ -595,7 +599,7 @@ const TopLevelMenuButton = GObject.registerClass(
                 Logger.error(`Could not parse shortcut '${accel}'`);
                 return;
             }
-            let seat = Clutter.get_default_backend().get_default_seat();
+            let seat = global.stage.context.get_backend().get_default_seat();
             let vd = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
             if (!vd) return;
 
@@ -728,7 +732,7 @@ export class MenuManager {
         getVirtualDevice() {
         if (!this._virtualDevice) {
             try {
-                const seat = Clutter.get_default_backend().get_default_seat();
+                const seat = global.stage.context.get_backend().get_default_seat();
                 this._virtualDevice = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
             } catch (e) {
                 Logger.error(`Failed to create virtual device: ${e}`);

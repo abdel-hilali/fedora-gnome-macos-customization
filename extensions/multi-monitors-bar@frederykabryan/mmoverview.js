@@ -46,9 +46,12 @@ export const setMMPanelArrayRef = Constants.setMMPanelArrayRef;
 
 export const THUMBNAILS_SLIDER_POSITION_ID = 'thumbnails-slider-position';
 
-// Vertical spacing of the overview as a share of its height: the value of
-// VERTICAL_SPACING_RATIO in overviewControls.js, which does not export it.
+// Private layout constants of overviewControls.js and workspacesView.js,
+// used to give the secondary app grid the same layout as the primary one.
+const SMALL_WORKSPACE_RATIO = OverviewControls.SMALL_WORKSPACE_RATIO ?? 0.15;
 const VERTICAL_SPACING_RATIO = 0.02;
+const SECONDARY_WORKSPACE_SCALE = 0.80;
+const WORKSPACE_MIN_SPACING = 24;
 // Padding around the search entry and the content area, in pixels.
 const OVERVIEW_GROUP_PADDING = 30;
 
@@ -312,7 +315,7 @@ class MultiMonitorsThumbnailsBoxClass extends St.Widget {
         if (!this._porthole || this._porthole.width <= 0 || this._porthole.height <= 0) {
             this._updatePorthole();
             if (!this._porthole || this._porthole.width <= 0 || this._porthole.height <= 0) {
-                console.debug('[Multi Monitors Add-On] Invalid porthole dimensions, skipping thumbnail creation');
+                console.debug('[MultiMonitors] Invalid porthole dimensions, skipping thumbnail creation');
                 return;
             }
         }
@@ -384,7 +387,7 @@ export const MultiMonitorsThumbnailsBox = GObject.registerClass({
 }, MultiMonitorsThumbnailsBoxClass);
 
 /* This isn't compatible with GNOME 40 and i don't know how to fix it -- TH
-var MultiMonitorsSlidingControl = (() => {
+const MultiMonitorsSlidingControl = (() => {
     let MultiMonitorsSlidingControl = class MultiMonitorsSlidingControl extends St.Widget {
     _init(params) {
         params = Params.parse(params, { slideDirection: OverviewControls.SlideDirection.LEFT });
@@ -428,7 +431,7 @@ var MultiMonitorsSlidingControl = (() => {
     return GObject.registerClass(MultiMonitorsSlidingControl);
 })();
 
-var MultiMonitorsThumbnailsSlider = (() => {
+const MultiMonitorsThumbnailsSlider = (() => {
     let MultiMonitorsThumbnailsSlider = class MultiMonitorsThumbnailsSlider extends MultiMonitorsSlidingControl {
     _init(thumbnailsBox) {
         super._init({ slideDirection: OverviewControls.SlideDirection.RIGHT });
@@ -470,7 +473,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             this._spacer_height = 0;
             this._fixGeometry = 0;
             this._visible = false;
-            this._destroying = false;
             this._pendingTimeouts = [];  // Track all one-shot timeouts for cleanup
             this._overviewStateAdjustment = null;
             this._overviewStateChangedId = 0;
@@ -522,9 +524,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             // Connect search entry to filter app grid locally
             this._searchEntry.clutter_text.connect('text-changed', actor => {
-                if (this._destroying)
-                    return;
-
                 const text = this._getSearchTextFromActor(actor);
                 // Filter the local app grid based on search text or app-grid state.
                 this._filterAppGrid(text);
@@ -532,9 +531,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             // Handle Enter key to activate focused app
             this._searchEntry.clutter_text.connect('activate', () => {
-                if (this._destroying)
-                    return;
-
                 if (this._focusedApp && this._focusedApp._appInfo) {
                     this._launchApp(this._focusedApp._appInfo);
                 }
@@ -542,9 +538,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             // Handle arrow keys to navigate between apps
             this._searchEntry.clutter_text.connect('key-press-event', (actor, event) => {
-                if (this._destroying)
-                    return Clutter.EVENT_PROPAGATE;
-
                 const symbol = event.get_key_symbol();
                 if (symbol === Clutter.KEY_Left || symbol === Clutter.KEY_Right ||
                     symbol === Clutter.KEY_Up || symbol === Clutter.KEY_Down) {
@@ -565,7 +558,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             });
 
             this._appGridContainer = new St.BoxLayout({
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 x_expand: true,
                 style: 'spacing: 10px;',
                 x_align: Clutter.ActorAlign.CENTER,
@@ -611,6 +604,20 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             this._contentArea.add_child(this._appGridScrollView);
             if (this._appDisplay)
                 this._contentArea.add_child(this._appDisplay);
+            // The app-grid layout follows the search entry, which is only
+            // placed once the content area is allocated.
+            this._contentArea.connectObject('notify::allocation', () => {
+                this._syncNativeAppDisplayInset();
+                if (this._appDisplayVisible)
+                    this._syncWorkspacesViewGeometry(true);
+            }, this);
+            // Ubuntu's grid picks its icon size when allocated (see
+            // _configureNativeAppDisplayLayout); follow the primary's choice.
+            const primaryGridLayout = this._getPrimaryAppGridLayout();
+            if (primaryGridLayout && typeof this._appDisplay?._grid?.setGridModes !== 'function') {
+                primaryGridLayout.connectObject('notify::icon-size',
+                    () => this._configureNativeAppDisplayLayout(), this);
+            }
 
 
             // 'page-changed' and 'page-empty' signals exist in GNOME < 46
@@ -628,7 +635,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             this._group = new St.BoxLayout({
                 name: 'mm-overview-group-' + index,
                 x_expand: true, y_expand: true,
-                vertical: true,
+                ...Common.verticalBoxProps(),
                 style: `padding: ${OVERVIEW_GROUP_PADDING}px;` // Add some padding so it doesn't touch edges
             });
             this.add_child(this._group);
@@ -665,28 +672,28 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             if (searchText !== null && searchText !== undefined)
                 return searchText;
 
-            if (this._destroying || !this._searchEntry)
+            if (!this._searchEntry)
                 return '';
 
             return this._searchEntry.get_text() ?? '';
         }
 
         _setSearchText(text) {
-            if (this._destroying || !this._searchEntry)
+            if (!this._searchEntry)
                 return;
 
             this._searchEntry.set_text(text);
         }
 
         _focusSearchEntry() {
-            if (this._destroying || !this._searchEntry)
+            if (!this._searchEntry)
                 return;
 
             this._searchEntry.grab_key_focus();
         }
 
         _setActorVisible(actor, visible) {
-            if (this._destroying || !actor)
+            if (!actor)
                 return false;
 
             actor.visible = visible;
@@ -702,9 +709,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         _onInstalledAppsChanged() {
-            if (this._destroying)
-                return;
-
             this._populateAppGrid();
             // Reapply the current query, including keyboard focus, while open.
             return this._syncAppGridState();
@@ -717,7 +721,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 return app.should_show();
             });
 
-            console.debug('[MultiMonitors] Found ' + apps.length + ' apps to display');
+            console.debug(`[MultiMonitors] Found ${apps.length} apps to display`);
 
             // Sort alphabetically
             apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
@@ -733,13 +737,10 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 this._appGrid.add_child(appButton);
             }
 
-            console.debug('[MultiMonitors] App grid populated with ' + apps.length + ' buttons');
+            console.debug(`[MultiMonitors] App grid populated with ${apps.length} buttons`);
         }
 
         _connectOverviewStateWatcher() {
-            if (this._destroying)
-                return;
-
             let adjustment = null;
             const controls = Main.overview?._overview?._controls ?? Main.overview?._controls;
             adjustment = controls?._stateAdjustment;
@@ -772,7 +773,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             const button = new St.Button({
                 style_class: 'app-well-app',
                 reactive: true,
-                button_mask: St.ButtonMask.ONE,
+                button_mask: (St.ButtonMask.PRIMARY ?? St.ButtonMask.ONE),
                 can_focus: true,
                 x_expand: false,
                 y_expand: false,
@@ -783,7 +784,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             button._appInfo = app;
 
             const box = new St.BoxLayout({
-                vertical: true, // Vertical layout for grid icon style
+                ...Common.verticalBoxProps(), // Vertical layout for grid icon style
                 x_align: Clutter.ActorAlign.CENTER,
                 y_align: Clutter.ActorAlign.CENTER,
                 style: 'spacing: 8px;',
@@ -802,13 +803,8 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             }
 
             // Shell.App.create_icon_texture() is unavailable on GNOME 46+.
-            if (!icon && typeof app.create_icon_texture === 'function') {
-                try {
-                    icon = app.create_icon_texture(86);
-                } catch (e) {
-                    console.debug('[MultiMonitors] Could not create app icon texture: ' + e);
-                }
-            }
+            if (!icon && typeof app.create_icon_texture === 'function')
+                icon = app.create_icon_texture(86);
 
             // Final fallback to generic icon
             if (!icon) {
@@ -846,9 +842,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         _setFocusedApp(app) {
-            if (this._destroying)
-                return;
-
             // Base style without highlight (use consistent sizing)
             const baseStyle = 'padding: 16px; margin: 8px; border-radius: 16px; min-width: 120px;';
             // Focused style uses box-shadow with white/gray color at 75% opacity
@@ -871,7 +864,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         _navigateApps(keySymbol) {
-            if (this._destroying || !this._appGrid) return;
+            if (!this._appGrid) return;
 
             // Get visible apps
             let children = [];
@@ -933,7 +926,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 try {
                     appInfo.launch([], null);
                 } catch (e) {
-                    console.warn('[MultiMonitors] Failed to launch app: ' + e.message);
+                    console.warn(`[MultiMonitors] Failed to launch app: ${e.message}`);
                 }
             }
 
@@ -993,7 +986,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         _configureNativeAppDisplayLayout() {
-            let layoutManager = null;
             if (!this._isActorUsable(this._appDisplay)) {
                 this._appDisplay = null;
                 this._appDisplayVisible = false;
@@ -1002,12 +994,30 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             this._syncNativeAppDisplayMargins();
 
-            layoutManager = this._appDisplay?._grid?.layoutManager;
+            const grid = this._appDisplay._grid;
+            const layoutManager = grid?.layoutManager;
             if (!layoutManager)
                 return;
 
+            // Ubuntu backports gnome-shell MR 4122, which drops grid modes and
+            // fits the grid to its allocation. Leave columns and rows to the
+            // shell, but use the primary grid's icon size so both monitors
+            // match: on its own this grid can settle on much smaller icons.
+            if (typeof grid.setGridModes !== 'function') {
+                const iconSize = this._getPrimaryAppGridLayout()?.iconSize ?? -1;
+                if (iconSize > 0 && layoutManager.fixedIconSize !== iconSize) {
+                    layoutManager.fixedIconSize = iconSize;
+                    // adaptToSize() only recomputes when the page size changes.
+                    layoutManager._pageWidth = -1;
+                    grid.queue_relayout();
+                }
+                return;
+            }
+
+            // Eight columns only fit full-size icons on wide monitors; on
+            // smaller ones IconGrid shrinks the icons to fit them all.
             const portrait = this._isPortraitMonitor();
-            const columns = portrait ? 4 : 8;
+            const columns = portrait ? 4 : (this._isNarrowMonitor() ? 6 : 8);
             const rows = portrait ? 5 : 3;
             const layoutKey = `${columns}x${rows}`;
 
@@ -1016,11 +1026,14 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 layoutManager.rowsPerPage === rows)
                 return;
 
-            layoutManager.columnsPerPage = columns;
-            layoutManager.rowsPerPage = rows;
+            // IconGrid chooses a mode again during allocation. Configure its
+            // modes too, otherwise it overwrites these dimensions and caches
+            // a different mode (depending on theme padding and monitor size).
+            // Reset the cached index when rotating: both modes use index 0.
+            grid.setGridModes([{ columns, rows }]);
+            grid._setGridMode(-1);
+            grid._setGridMode(0);
             this._lastAppDisplayLayout = layoutKey;
-
-            this._appDisplay._grid.queue_relayout();
         }
 
         _syncNativePageIndicatorsPosition() {
@@ -1097,8 +1110,10 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         _getWorkspacesStrip(view) {
             const metrics = this._getAppGridMetrics();
             const parent = view?.get_parent();
+            // Not has_allocation(): it is false while a relayout is queued, which
+            // showing the app grid does (GNOME 51 then never used the strip).
             if (this._destroying || !metrics || !parent ||
-                !this._contentArea?.has_allocation())
+                !this._contentArea?.get_stage())
                 return null;
 
             const [, contentY] = this._contentArea.get_transformed_position();
@@ -1181,26 +1196,57 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
             return !!monitor && monitor.height > monitor.width;
         }
 
-        _getAppGridWorkspacePreviewGeometry() {
+        _isNarrowMonitor() {
             const monitor = Main.layoutManager.monitors[this._monitorIndex];
-            if (!monitor)
+            return !!monitor && monitor.width < 1600;
+        }
+
+        _getPrimaryAppGridLayout() {
+            return Main.overview._overview?._controls?._appDisplay?._grid?.layout_manager ?? null;
+        }
+
+        _getAppGridWorkspacesBox() {
+            const monitor = Main.layoutManager.monitors[this._monitorIndex];
+            const workArea = Main.layoutManager.getWorkAreaForMonitor(this._monitorIndex);
+            // Not has_allocation(): it is false while a relayout is queued,
+            // which showing the app grid does, and the content area's own
+            // box does not change afterwards to notify us again.
+            if (!monitor || !workArea || !this._contentArea?.get_stage())
                 return null;
 
-            const portrait = this._isPortraitMonitor();
-            const width = portrait
-                ? Math.max(240, Math.min(Math.round(monitor.width * 0.25), 320))
-                : Math.max(560, Math.min(Math.round(monitor.width * 0.34), 700));
-            const height = Math.round(width * 0.28);
-            const yOffset = portrait
-                ? Math.max(24, Math.round(monitor.height * 0.018))
-                : Math.max(88, Math.round(monitor.height * 0.075));
+            // Same as the primary's ControlsManagerLayout in the app-grid
+            // state: below the search entry, a strip SMALL_WORKSPACE_RATIO of
+            // the overview height, followed by the app grid.
+            const overviewHeight = monitor.y + monitor.height - workArea.y;
+            const spacing = Math.round(overviewHeight * VERTICAL_SPACING_RATIO);
+            const [, contentY] = this._contentArea.get_transformed_position();
 
             return {
-                x: monitor.x + Math.round((monitor.width - width) / 2),
-                y: monitor.y + yOffset,
-                width,
-                height,
+                x: monitor.x,
+                y: Math.round(contentY) + spacing,
+                width: monitor.width,
+                height: Math.round(overviewHeight * SMALL_WORKSPACE_RATIO),
+                spacing,
             };
+        }
+
+        _getFitAllWorkspaceHeight(width, height, nWorkspaces, aspectRatio) {
+            // WorkspacesView._getFirstFitAllWorkspaceBox(): workspaces side by
+            // side, with spacing around each, limited by the box height.
+            const { scaleFactor } = St.ThemeContext.get_for_stage(global.stage);
+            const spacing = WORKSPACE_MIN_SPACING * scaleFactor;
+            const workspaceWidth = (width - spacing * (nWorkspaces + 1)) / nWorkspaces;
+            return Math.min(workspaceWidth * aspectRatio, height);
+        }
+
+        // macstyle: upstream's hook (v62) sets margin_top on the actor, which St
+        // resets from the style when the grid is shown, and leaves no room for
+        // the dock. Use our style-based margins instead.
+        _syncNativeAppDisplayInset() {
+            if (!this._appDisplay || !this._contentArea?.has_allocation())
+                return;
+
+            this._syncNativeAppDisplayMargins();
         }
 
         _getFullWorkspaceGeometry() {
@@ -1253,21 +1299,41 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 return;
             }
 
-            const compactGeometry = this._getAppGridWorkspacePreviewGeometry();
-            if (!compactGeometry)
+            const box = this._getAppGridWorkspacesBox();
+            if (!box)
                 return;
 
-            const scale = compactGeometry.width / fullGeometry.width;
+            // The borrowed SecondaryMonitorDisplay lays out the app-grid state
+            // itself: workspaces side by side, centered in the middle
+            // SECONDARY_WORKSPACE_SCALE of its height. Scale it so they get
+            // the size they would have in the primary's strip, and center
+            // them on that strip.
+            const aspectRatio = fullGeometry.height / fullGeometry.width;
+            const nWorkspaces = global.workspace_manager.n_workspaces;
+            const nShown = this._workspacesViews._workspacesView?._workspaces?.length ?? 1;
+            const targetHeight = this._getFitAllWorkspaceHeight(
+                box.width, box.height, nWorkspaces, aspectRatio);
+            const drawnHeight = this._getFitAllWorkspaceHeight(
+                fullGeometry.width, fullGeometry.height * SECONDARY_WORKSPACE_SCALE,
+                Math.max(1, nShown), aspectRatio);
+            if (targetHeight <= 0 || drawnHeight <= 0)
+                return;
+
+            const scale = targetHeight / drawnHeight;
+            const translationX = Math.round(box.x + box.width / 2 -
+                fullGeometry.x - scale * fullGeometry.width / 2);
+            const translationY = Math.round(box.y + box.height / 2 -
+                fullGeometry.y - scale * fullGeometry.height / 2);
             const transformKey = [
-                Math.round(compactGeometry.x),
-                Math.round(compactGeometry.y),
+                translationX,
+                translationY,
                 Math.round(scale * 1000),
             ].join(':');
             if (this._lastWorkspaceTransformKey === transformKey)
                 return;
 
-            this._workspacesViews.translation_x = compactGeometry.x - fullGeometry.x;
-            this._workspacesViews.translation_y = compactGeometry.y - fullGeometry.y;
+            this._workspacesViews.translation_x = translationX;
+            this._workspacesViews.translation_y = translationY;
             this._workspacesViews.scale_x = scale;
             this._workspacesViews.scale_y = scale;
             this._lastWorkspaceTransformKey = transformKey;
@@ -1290,15 +1356,10 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         async _syncAppGridState(searchText = null) {
-            if (this._destroying)
-                return;
-
             const requestId = this._appSearchRequestId = (this._appSearchRequestId ?? 0) + 1;
             const normalizedSearch = this._getSearchText(searchText).toLowerCase().trim();
             const hasText = this._visible && normalizedSearch.length > 0;
             const showApps = this._visible && this._isAppGridState();
-            if (this._destroying)
-                return;
             const useNativeAppDisplay = !!this._appDisplay;
 
             if (!this._appGrid) return;
@@ -1308,14 +1369,10 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
                 if (this._appGridScrollView) {
                     this._setActorVisible(this._appGridScrollView, false);
-                    if (this._destroying)
-                        return;
                 }
 
                 if (this._appDisplayVisible && this._appDisplay) {
                     this._setActorVisible(this._appDisplay, false);
-                    if (this._destroying)
-                        return;
                 }
                 this._appDisplayVisible = false;
 
@@ -1323,8 +1380,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                 // its geometry. Restore both when returning to the window picker.
                 if (this._visible) {
                     this._tryFindWorkspacesViews();
-                    if (this._destroying)
-                        return;
                 }
                 this._resetWorkspacesViewTransform();
                 this._lastWorkspaceTransformKey = null;
@@ -1335,8 +1390,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
                 if (this._thumbnailsBox) {
                     this._setActorVisible(this._thumbnailsBox, true);
-                    if (this._destroying)
-                        return;
                 }
 
                 if (this._searchController)
@@ -1362,10 +1415,10 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                     matchingIds = await this._appSearchProvider.getInitialResultSet(
                         normalizedSearch.split(/\s+/), null);
                 } catch (e) {
-                    console.debug('[MultiMonitors] App search failed: ' + e);
+                    console.debug(`[MultiMonitors] App search failed: ${e}`);
                 }
                 // Typing, closing, installing apps, or teardown can supersede a search.
-                if (this._destroying || requestId !== this._appSearchRequestId)
+                if (requestId !== this._appSearchRequestId)
                     return;
 
                 const buttons = new Map(children.filter(child => child._appInfo)
@@ -1411,29 +1464,20 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             // Toggle visibility of the entire scroll view based on search text
             if (this._appGridScrollView) {
-                console.debug('[MultiMonitors] _filterAppGrid: hasText=' + hasText + ', visibleApps=' + visibleCount);
+                console.debug(`[MultiMonitors] _filterAppGrid: hasText=${hasText}, visibleApps=${visibleCount}`);
 
                 // Always re-discover workspacesViews to ensure we have a valid reference
                 this._tryFindWorkspacesViews();
-                if (this._destroying)
-                    return;
 
                 this._setActorVisible(this._appGridScrollView, hasText || (showApps && !useNativeAppDisplay));
-                if (this._destroying)
-                    return;
 
                 if (this._appDisplay) {
                     const nextAppDisplayVisible = showApps && !hasText;
                     this._configureNativeAppDisplayLayout();
-                    if (this._destroying)
-                        return;
                     if (this._appDisplay) {
                         this._syncNativePageIndicatorsPosition();
-                        if (this._destroying)
-                            return;
+                        this._syncNativeAppDisplayInset();
                         this._setActorVisible(this._appDisplay, nextAppDisplayVisible);
-                        if (this._destroying)
-                            return;
                         if (nextAppDisplayVisible && !this._appDisplayVisible)
                             this._refreshNativeAppDisplay();
                         this._appDisplayVisible = nextAppDisplayVisible && !!this._appDisplay;
@@ -1455,14 +1499,12 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
                     this._workspacesViews.visible = !hasText;
                     this._workspacesViews.opacity = hasText ? 0 : 255;
                     this._syncWorkspacesViewGeometry(showApps && !hasText);
-                    console.debug('[MultiMonitors] Set workspacesViews visible=' + !hasText + ', opacity=' + (hasText ? 0 : 255));
+                    console.debug(`[MultiMonitors] Set workspacesViews visible=${!hasText}, opacity=${hasText ? 0 : 255}`);
                 }
 
                 // Also hide our own thumbnails box when searching or showing apps.
                 if (this._thumbnailsBox) {
                     this._setActorVisible(this._thumbnailsBox, !(hasText || showApps));
-                    if (this._destroying)
-                        return;
                 }
 
                 // Hide the searchController placeholder when using our own grid.
@@ -1488,7 +1530,7 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
 
             if (workspacesDisplay && workspacesDisplay._workspacesViews && workspacesDisplay._workspacesViews[this._monitorIndex]) {
                 this._setWorkspacesViews(workspacesDisplay._workspacesViews[this._monitorIndex]);
-                console.debug('[MultiMonitors] Lazy discovery: Found workspacesView for monitor ' + this._monitorIndex);
+                console.debug(`[MultiMonitors] Lazy discovery: Found workspacesView for monitor ${this._monitorIndex}`);
             } else if (workspacesDisplay && workspacesDisplay._primaryWorkspacesView && this._monitorIndex === Main.layoutManager.primaryIndex) {
                 this._setWorkspacesViews(workspacesDisplay._primaryWorkspacesView);
                 console.debug('[MultiMonitors] Lazy discovery: Found primary workspacesView');
@@ -1528,9 +1570,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         show() {
-            if (this._destroying)
-                return;
-
             // Called when overview is shown
             this._visible = true;
             this._connectOverviewStateWatcher();
@@ -1561,9 +1600,6 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         hide() {
-            if (this._destroying)
-                return;
-
             // Called when overview is closed - clear the search input
             this._visible = false;
             this._setSearchText('');
@@ -1581,7 +1617,9 @@ export const MultiMonitorsControlsManager = GObject.registerClass(
         }
 
         _disconnectAll() {
-            this._destroying = true;
+            // Supersede any in-flight async app search so its continuation
+            // returns at the requestId check instead of touching torn-down actors.
+            this._appSearchRequestId = (this._appSearchRequestId ?? 0) + 1;
 
             // Remove all pending timeouts per EGO guidelines
             for (let timeoutId of this._pendingTimeouts) {
@@ -1712,7 +1750,7 @@ export const MultiMonitorsOverviewActor = GObject.registerClass(
                 /* Translators: This is the main view to select
                     activities. See also note for "Activities" string. */
                 accessible_name: _("MMOverview@" + index),
-                vertical: true,
+                ...Common.verticalBoxProps(),
             });
 
             this.add_constraint(new LayoutManager.MonitorConstraint({ index: this._monitorIndex }));

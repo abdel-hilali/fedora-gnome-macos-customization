@@ -181,11 +181,10 @@ export class EmulateX11WindowType {
     }
 
     enable() {
-        this._idMap = global.window_manager.connect_after('map', (obj, windowActor) => {
-            const window = windowActor.get_meta_window();
+        global.display.connectObject('window-created', (_, window) => {
             if (this._waylandClient && this._waylandClient.query_window_belongs_to(window))
                 this.addWindow(window);
-        });
+        }, this);
     }
 
     disable() {
@@ -195,10 +194,7 @@ export class EmulateX11WindowType {
         this._windowList = [];
 
         // disconnect signals
-        if (this._idMap) {
-            global.window_manager.disconnect(this._idMap);
-            this._idMap = null;
-        }
+        global.display.disconnectObject(this);
         this.refreshWindowsPosition();
     }
 

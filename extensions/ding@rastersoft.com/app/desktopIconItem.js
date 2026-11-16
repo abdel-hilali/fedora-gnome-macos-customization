@@ -415,7 +415,7 @@ export var desktopIconItem = class desktopIconItem extends SignalManager.SignalM
 
         if (grabFocus) {
             this.setAccessibleName(this._getVisibleName());
-            this._accessibleBox.grabFocus();
+            this._accessibleBox.grab_focus();
         }
     }
 
